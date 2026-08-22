@@ -2,6 +2,7 @@
 const user = require("../Models/user");
 const {mailSender} = require("../Utilities/mailSender");
 const bcrypt = require("bcryptjs");
+const crypto = require("node:crypto");
 const { ResetPasswordLink } = require("../mail/templates/ResetPasswordToken")
 
 exports.forgotpasswordToken = async (req, res) => {
@@ -23,7 +24,7 @@ exports.forgotpasswordToken = async (req, res) => {
       });
     }
 
-    const token = crypto.randomUUID(20).toString("hex");
+    const token = crypto.randomBytes(32).toString("hex");
 
       await user.findOneAndUpdate(
       { email: email },
@@ -91,11 +92,21 @@ exports.forgotPassword = async (req, res) => {
     }
 
 
-    const hasedPassword = await bcrypt.hash(password , 10)
+    const hasedPassword = await bcrypt.hash(password , 12)
 
     const updatedUser = await user.findOneAndUpdate(
       { token: token },
-      { password: hasedPassword },
+      {
+        $set: {
+          password: hasedPassword,
+          sessions: [],
+        },
+        $unset: {
+          token: "",
+          resetPasswordExpires: "",
+        },
+        $inc: { tokenVersion: 1 },
+      },
       { new: true }
     );
 

@@ -1,347 +1,451 @@
-const user = require("../Models/user");
-const OTP = require("../Models/otpSchema");
+const crypto = require("node:crypto");
 const bcrypt = require("bcryptjs");
-const profile = require("../Models/profile");
 const jwt = require("jsonwebtoken");
-const cookie = require("cookie-parser");
 const otpGenerator = require("otp-generator");
+const User = require("../Models/user");
+const OTP = require("../Models/otpSchema");
+const Profile = require("../Models/profile");
 const passwordUpdate = require("../mail/templates/passwordUpdate");
 const { mailSender } = require("../Utilities/mailSender");
+const ApiError = require("../Utilities/ApiError");
+const ApiResponse = require("../Utilities/ApiResponse");
+const asyncHandler = require("../Utilities/asyncHandler");
+const { logAudit } = require("../Utilities/auditService");
+const { notifyUser } = require("../Utilities/notificationService");
 require("dotenv").config();
 
+const ACCESS_TOKEN_TTL = "15m";
+const REFRESH_TOKEN_DAYS = 30;
+const MAX_FAILED_LOGINS = 5;
+const LOCK_MINUTES = 15;
 
-// send OTP check
-exports.sendOTP = async (req, res) => {
-  try {
-    const email = req.body.email?.trim().toLowerCase();
+function normalizeEmail(email) {
+  return email?.trim().toLowerCase();
+}
 
-    console.log({ email } , "sendOTP") ;
+function getAccessSecret() {
+  return process.env.JWT_ACCESS_SECRET || process.env.SECRET_KEY;
+}
 
-    if (!email) {
-      return res.status(400).json({
-        success: false,
-        message: "enter the email",
-      });
-    }
+function getRefreshSecret() {
+  return process.env.JWT_REFRESH_SECRET || process.env.SECRET_KEY;
+}
 
-    const result = await user.findOne({ email: email });
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
 
-    if (result) {
-      return res.status(409).json({
-        success: false,
-        message:
-          "you are already exist in our database so go to login page and make login",
-      });
-    }
+function refreshCookieOptions() {
+  return {
+    maxAge: REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+  };
+}
 
-    
+function publicUser(user) {
+  const output = user.toObject ? user.toObject() : { ...user };
+  delete output.password;
+  delete output.sessions;
+  delete output.token;
+  delete output.resetPasswordExpires;
+  return output;
+}
 
-    var otp = otpGenerator.generate(6, {
+function buildProfilePayload(body) {
+  return {
+    gender: body.gender || null,
+    dateOfBirth: body.dateOfBirth || null,
+    about: body.about || null,
+    contactNumber: body.contactNumber || body.phone || null,
+    address: body.address || null,
+    middleName: body.middleName || null,
+    nativePlace: body.nativePlace || null,
+    currentCity: body.currentCity || body.city || null,
+    education: body.education || null,
+    profession: body.profession || null,
+    gotra: body.gotra || null,
+    identityDocument: body.identityDocument || undefined,
+    photo: body.photo || undefined,
+  };
+}
+
+function signAccessToken(user) {
+  return jwt.sign(
+    {
+      userId: user._id,
+      id: user._id,
+      email: user.email,
+      roles: user.roles,
+      accountType: user.accountType,
+      tokenVersion: user.tokenVersion,
+    },
+    getAccessSecret(),
+    { expiresIn: ACCESS_TOKEN_TTL }
+  );
+}
+
+function signRefreshToken(user) {
+  return jwt.sign(
+    {
+      userId: user._id,
+      tokenVersion: user.tokenVersion,
+      nonce: crypto.randomUUID(),
+    },
+    getRefreshSecret(),
+    { expiresIn: `${REFRESH_TOKEN_DAYS}d` }
+  );
+}
+
+async function issueSession(user, req, res) {
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000);
+
+  user.sessions.push({
+    tokenHash: hashToken(refreshToken),
+    device: req.header("user-agent") || "unknown",
+    ip: req.ip,
+    expiresAt,
+  });
+  await user.save();
+
+  res.cookie("refreshToken", refreshToken, refreshCookieOptions());
+  res.cookie("token", accessToken, {
+    maxAge: 15 * 60 * 1000,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+  });
+
+  return accessToken;
+}
+
+exports.sendOTP = asyncHandler(async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+
+  if (!email) {
+    throw new ApiError(400, "EMAIL_REQUIRED", "Enter the email");
+  }
+
+  const existingUser = await User.findOne({ email });
+  if (existingUser) {
+    throw new ApiError(409, "EMAIL_ALREADY_REGISTERED", "This email is already registered");
+  }
+
+  let otp = otpGenerator.generate(6, {
+    lowerCaseAlphabets: false,
+    upperCaseAlphabets: false,
+    specialChars: false,
+  });
+
+  while (await OTP.findOne({ otp })) {
+    otp = otpGenerator.generate(6, {
       lowerCaseAlphabets: false,
       upperCaseAlphabets: false,
       specialChars: false,
     });
-  
+  }
 
-    let sameOtpPresent = await OTP.findOne({ otp: otp });
+  await OTP.create({ email, otp });
 
-    while (sameOtpPresent) {
-      otp = otpGenerator.generate(6, {
-        lowerCaseAlphabets: false,
-        upperCaseAlphabets: false,
-        specialChars: false,
-      });
+  return res.status(200).json(new ApiResponse("OTP sent successfully"));
+});
 
-      sameOtpPresent = await OTP.findOne({ otp: otp });
+exports.signUP = asyncHandler(async (req, res) => {
+  const { firstName, lastName, password, confirmPassword, otp } = req.body;
+  const email = normalizeEmail(req.body.email);
+
+  if (!firstName || !lastName || !email || !password || !confirmPassword || !otp) {
+    throw new ApiError(400, "REGISTRATION_FIELDS_REQUIRED", "Enter all required registration details");
+  }
+
+  if (password !== confirmPassword) {
+    throw new ApiError(400, "PASSWORD_MISMATCH", "Password and confirm password do not match");
+  }
+
+  const existingUser = await User.findOne({ email });
+  if (existingUser) {
+    throw new ApiError(409, "EMAIL_ALREADY_REGISTERED", "This email is already registered");
+  }
+
+  const recentOtp = await OTP.find({ email }).sort({ createdAt: -1 }).limit(1);
+  if (recentOtp.length === 0 || !recentOtp[0]) {
+    throw new ApiError(400, "OTP_NOT_FOUND", "OTP is not found");
+  }
+
+  if (String(otp) !== String(recentOtp[0].otp)) {
+    throw new ApiError(400, "OTP_INVALID", "OTP is invalid");
+  }
+
+  const hashedPassword = await bcrypt.hash(password, 12);
+  const profileDetails = await Profile.create(buildProfilePayload(req.body));
+  const createdUser = await User.create({
+    firstName,
+    lastName,
+    email,
+    accountType: "Member",
+    roles: ["MEMBER"],
+    accountStatus: "PENDING",
+    approved: false,
+    password: hashedPassword,
+    imageUrl: `https://api.dicebear.com/5.x/initials/svg?seed=${firstName}-${lastName}`,
+    additionalDetails: profileDetails._id,
+    reviewHistory: [{
+      action: "SUBMITTED",
+      reason: "Registration submitted",
+    }],
+  });
+
+  return res.status(201).json(new ApiResponse("Registration submitted successfully", {
+    user: publicUser(createdUser),
+    accountStatus: createdUser.accountStatus,
+  }));
+});
+
+exports.login = asyncHandler(async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+
+  if (!email || !password) {
+    throw new ApiError(400, "LOGIN_FIELDS_REQUIRED", "Fill all required login details");
+  }
+
+  const user = await User.findOne({ email }).populate("additionalDetails");
+  if (!user) {
+    throw new ApiError(404, "USER_NOT_FOUND", "No account exists for this email");
+  }
+
+  if (user.lockedUntil && user.lockedUntil > new Date()) {
+    throw new ApiError(423, "ACCOUNT_LOCKED", "Too many failed attempts. Try again later");
+  }
+
+  const passwordMatches = await bcrypt.compare(password, user.password);
+  if (!passwordMatches) {
+    user.failedLoginAttempts += 1;
+    if (user.failedLoginAttempts >= MAX_FAILED_LOGINS) {
+      user.lockedUntil = new Date(Date.now() + LOCK_MINUTES * 60 * 1000);
     }
+    await user.save();
+    throw new ApiError(401, "PASSWORD_INCORRECT", "Password is incorrect");
+  }
 
-    await OTP.create({ email, otp });
+  if (!user.active || ["SUSPENDED", "DEACTIVATED"].includes(user.accountStatus)) {
+    throw new ApiError(403, "ACCOUNT_INACTIVE", "This account is not active");
+  }
 
-    res.status(200).json({
-      success: true,
-      message: "entery of otp successfully created in database",
-      otp
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message:
-        "there should be some error in sending the otp to the user's email",
+  if (["PENDING", "CORRECTION_REQUESTED", "REJECTED"].includes(user.accountStatus)) {
+    throw new ApiError(403, `ACCOUNT_${user.accountStatus}`, "Your application is not active yet", {
+      accountStatus: user.accountStatus,
+      latestReview: user.reviewHistory?.[user.reviewHistory.length - 1] || null,
     });
   }
-};
 
-// signUP  check
-exports.signUP = async (req, res) => {
+  user.failedLoginAttempts = 0;
+  user.lockedUntil = undefined;
+  const accessToken = await issueSession(user, req, res);
 
-  
+  return res.status(200).json(new ApiResponse("User logged in successfully", {
+    token: accessToken,
+    accessToken,
+    user: publicUser(user),
+  }));
+});
+
+exports.refreshAccessToken = asyncHandler(async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+  if (!refreshToken) {
+    throw new ApiError(401, "REFRESH_TOKEN_MISSING", "Refresh token is missing");
+  }
+
+  let payload;
   try {
-    const {
-      firstName,
-      lastName,
-      email,
-      password,
-      confirmPassword,
-      accountType,
-      otp,
-    } = req.body;
-
-    
-
-    if (
-      !firstName ||
-      !lastName ||
-      !email ||
-      !password ||
-      !confirmPassword ||
-      !accountType ||
-      !otp
-    ) {
-      return res.status(401).json({
-        success: false,
-        message: "enter all details in signUp form carefully",
-      });
-    }
-
-    
-    
-
-    if (password !== confirmPassword) {
-      return res.status(401).json({
-        success: false,
-        message: "password and confirmedPassword can't matched",
-      });
-    }
-   
-    const checkUser = await user.findOne({ email: email });
-
-   
-
-    if (checkUser) {
-      return res.status(401).json({
-        success: false,
-        message:
-          "you are already register with these email on our plateform go through the login page or start signUp with another email address",
-      });
-    }
-    
-  
-// find recent otp from otp schema
-    const recentOtp = await OTP.find({ email: email })
-      .sort({ createdAt: -1 })
-      .limit(1);
-
-      // console.log(recentOtp)
-      
-    if (recentOtp.length === 0 || !recentOtp[0]) {
-      return res.status(400).json({
-        success: false,
-        message: "OTP is not Found",
-      });
-    } else if ( otp !== recentOtp[0].otp ) {
-      return res.status(400).json({
-        success: false,
-        message: "OTP is Invalid",
-      });
-    }
-   
-   
-    const hashedPassword = await bcrypt.hash(password , 10);
-    // console.log(hashedPassword)
-
-    // Create the user
-		let approved = "";
-    accountType === "Instructor" ? (approved = false) : (approved = true)
-		// approved === "Instructor" ? (approved = false) : (approved = true);    yeh line sahi hai
-
-
-    
-
-    const profileDetails = await profile.create({
-      gender: null,
-      dateOfBirth: null,
-      about: null,
-      contactNumber: null,
-    });
-    
-    const createUser = await user.create({
-      firstName,
-      lastName,
-      email,
-      accountType,
-      approved:approved,
-      password:hashedPassword,
-      imageUrl:`https://api.dicebear.com/5.x/initials/svg?seed=${firstName}-${lastName}`,
-      additionalDetails: profileDetails._id,
-    });
-    // console.log("hi")
-    
-
-    return res.status(200).json({
-      success: true,
-      createUser,
-      message: "user signUp successfully",
-    })
+    payload = jwt.verify(refreshToken, getRefreshSecret());
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: "user signUp request fails",
+    throw new ApiError(401, "REFRESH_TOKEN_INVALID", "Refresh token is invalid");
+  }
+
+  const user = await User.findById(payload.userId);
+  if (!user || user.tokenVersion !== payload.tokenVersion || user.accountStatus !== "ACTIVE") {
+    throw new ApiError(401, "REFRESH_TOKEN_REVOKED", "Refresh token is no longer valid");
+  }
+
+  const tokenHash = hashToken(refreshToken);
+  const sessionIndex = user.sessions.findIndex((session) => (
+    session.tokenHash === tokenHash && session.expiresAt && session.expiresAt > new Date()
+  ));
+
+  if (sessionIndex === -1) {
+    user.sessions = [];
+    await user.save();
+    throw new ApiError(401, "REFRESH_TOKEN_REPLAYED", "Refresh token was reused or expired");
+  }
+
+  user.sessions.splice(sessionIndex, 1);
+  const accessToken = await issueSession(user, req, res);
+
+  return res.status(200).json(new ApiResponse("Access token refreshed", { accessToken, token: accessToken }));
+});
+
+exports.logout = asyncHandler(async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+
+  if (refreshToken && req.user?.id) {
+    await User.findByIdAndUpdate(req.user.id, {
+      $pull: {
+        sessions: {
+          tokenHash: hashToken(refreshToken),
+        },
+      },
     });
   }
-};
 
-// login  check
-exports.login = async (req, res) => {
+  res.clearCookie("refreshToken", refreshCookieOptions());
+  res.clearCookie("token");
+  return res.status(200).json(new ApiResponse("Logged out successfully"));
+});
+
+exports.changePassword = asyncHandler(async (req, res) => {
+  const userDetails = await User.findById(req.user.id);
+  const { oldPassword, newPassword, confirmNewPassword } = req.body;
+
+  const isPasswordMatch = await bcrypt.compare(oldPassword, userDetails.password);
+  if (!isPasswordMatch) {
+    throw new ApiError(401, "OLD_PASSWORD_INCORRECT", "The old password is incorrect");
+  }
+
+  if (newPassword !== confirmNewPassword) {
+    throw new ApiError(400, "PASSWORD_MISMATCH", "The password and confirm password do not match");
+  }
+
+  userDetails.password = await bcrypt.hash(newPassword, 12);
+  userDetails.tokenVersion += 1;
+  userDetails.sessions = [];
+  await userDetails.save();
+
   try {
-    const email = req.body.email?.trim().toLowerCase();
-    const { password } = req.body;
-    console.log(email, "login request")
-
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "fill all required details in login form",
-      });
-    }
-
-  
-
-    const User = await user.findOne({ email: email }).populate("additionalDetails")
-    console.log(User)
-
-    if (!User) {
-      return res.status(404).json({
-        success: false,
-        message:
-          "user can't be registerd in our database with these email Address so go though with signUp",
-      });
-    }
-
-    if (User.password === 'GOOGLE_AUTH_USER') {
-      return res.status(400).json({
-        success: false,
-        googleAuth:true,
-        message:
-          "you are SignUp using GoogleAuth so now also login with that",
-      });
-    }
-
-    
-    if (await bcrypt.compare(password , User.password )) {
-      
-      const payload = {
-        email: User.email,
-        id: User._id,
-        accountType: User.accountType,
-      };
-      // console.log(payload)
-      const token = jwt.sign(payload, process.env.SECRET_KEY, {
-        expiresIn: "24h",
-      });
-      // console.log("token" ,token)
-
-
-      User.token = token;
-      User.password = undefined;
-      // console.log(User)
-
-      const options = {
-        maxAge: 3 * 24 * 60 * 60 * 1000,
-        httpOnly:true
-      };
-     
-     return  res.cookie("token", token , options).status(200).json({
-        success: true,
-        token,
-        User,
-        message: "User Logged in Successfully",
-      });
-
-       
-     
-    } else {
-      return res.status(401).json({
-        success: false,
-        message: "Password is Incorrect",
-      });
-    }
+    await mailSender(
+      userDetails.email,
+      "Password changed successfully",
+      passwordUpdate(userDetails.email, userDetails.firstName)
+    );
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: `user login request fail  due to some error : ${error}`,
-    });
+    console.error("Password change email failed", error);
   }
-};
 
-// Controller for Changing Password
-exports.changePassword = async (req, res) => {
-	try {
-		// Get user data from req.user
-    // console.log(req.body)
-		const userDetails = await user.findById(req.user.id);
+  return res.status(200).json(new ApiResponse("Password updated successfully"));
+});
 
-		// Get old password, new password, and confirm new password from req.body
-		const { oldPassword, newPassword, confirmNewPassword } = req.body;
+exports.listPendingRegistrations = asyncHandler(async (req, res) => {
+  const users = await User.find({
+    accountStatus: { $in: ["PENDING", "CORRECTION_REQUESTED"] },
+  })
+    .populate("additionalDetails")
+    .sort({ createdAt: -1 });
 
-		// Validate old password
-		const isPasswordMatch = await bcrypt.compare(
-			oldPassword,
-			userDetails.password
-		);
-		if (!isPasswordMatch) {
-			// If old password does not match, return a 401 (Unauthorized) error
-			return res
-				.status(401)
-				.json({ success: false, message: "The password is incorrect" });
-		}
+  return res.status(200).json(new ApiResponse("Registration queue fetched", {
+    users: users.map(publicUser),
+  }));
+});
 
-		// Match new password and confirm new password
-		if (newPassword !== confirmNewPassword) {
-			// If new password and confirm new password do not match, return a 400 (Bad Request) error
-			return res.status(400).json({
-				success: false,
-				message: "The password and confirm password does not match",
-			});
-		}
+exports.reviewRegistration = asyncHandler(async (req, res) => {
+  const { userId } = req.params;
+  const { action, reason } = req.body;
 
-		// Update password
-		const encryptedPassword = await bcrypt.hash(newPassword, 10);
-		const updatedUserDetails = await user.findByIdAndUpdate(
-			req.user.id,
-			{ password: encryptedPassword },
-			{ new: true }
-		);
+  const statusByAction = {
+    APPROVE: "ACTIVE",
+    REJECT: "REJECTED",
+    REQUEST_CORRECTION: "CORRECTION_REQUESTED",
+  };
+  const historyActionByAction = {
+    APPROVE: "APPROVED",
+    REJECT: "REJECTED",
+    REQUEST_CORRECTION: "CORRECTION_REQUESTED",
+  };
 
-		// Send notification email
-		try {
-			const emailResponse = await mailSender(
-				updatedUserDetails.email,
-        "Password Changed Succssful",
-				passwordUpdate(updatedUserDetails.email, updatedUserDetails.firstName)
-			);
-			// console.log("Email sent successfully:", emailResponse.response);
-		} catch (error) {
-			// If there's an error sending the email, log the error and return a 500 (Internal Server Error) error
-			// console.error("Error occurred while sending email:", error);
-			return res.status(500).json({
-				success: false,
-				message: "Error occurred while sending email",
-				error: error.message,
-			});
-		}
+  if (!statusByAction[action]) {
+    throw new ApiError(400, "INVALID_REVIEW_ACTION", "Review action must be APPROVE, REJECT, or REQUEST_CORRECTION");
+  }
 
-		// Return success response
-		return res
-			.status(200)
-			.json({ success: true, message: "Password updated successfully" });
-	} catch (error) {
-		// If there's an error updating the password, log the error and return a 500 (Internal Server Error) error
-		console.error("Error occurred while updating password:", error);
-		return res.status(500).json({
-			success: false,
-			message: "Error occurred while updating password",
-			error: error.message,
-		});
-	}
-};
+  const user = await User.findOne({
+    _id: userId,
+    accountStatus: { $in: ["PENDING", "CORRECTION_REQUESTED"] },
+  });
 
+  if (!user) {
+    throw new ApiError(404, "REGISTRATION_NOT_REVIEWABLE", "Registration was not found or is not reviewable");
+  }
+
+  const previousStatus = user.accountStatus;
+  user.accountStatus = statusByAction[action];
+  user.approved = action === "APPROVE";
+  if (action === "APPROVE" && (!user.roles || user.roles.length === 0)) {
+    user.roles = ["MEMBER"];
+  }
+  user.reviewHistory.push({
+    action: historyActionByAction[action],
+    reason,
+    reviewedBy: req.user.id,
+  });
+  await user.save();
+
+  await logAudit({
+    actor: req.user.id,
+    action: `registration.${historyActionByAction[action].toLowerCase()}`,
+    targetType: "user",
+    target: user._id,
+    oldValue: { accountStatus: previousStatus },
+    newValue: { accountStatus: user.accountStatus },
+    reason,
+    req,
+  });
+
+  await notifyUser({
+    recipient: user._id,
+    title: "Registration review updated",
+    message: `Your registration status is now ${user.accountStatus}.`,
+    metadata: { accountStatus: user.accountStatus, reason },
+    email: false,
+  });
+
+  return res.status(200).json(new ApiResponse("Registration reviewed successfully", {
+    user: publicUser(user),
+  }));
+});
+
+exports.resubmitRegistration = asyncHandler(async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+
+  if (!email || !req.body.password) {
+    throw new ApiError(400, "RESUBMIT_CREDENTIALS_REQUIRED", "Email and password are required to resubmit");
+  }
+
+  const user = await User.findOne({ email });
+
+  if (!user || !["REJECTED", "CORRECTION_REQUESTED"].includes(user.accountStatus)) {
+    throw new ApiError(400, "REGISTRATION_NOT_RESUBMITTABLE", "This registration cannot be resubmitted");
+  }
+
+  const passwordMatches = await bcrypt.compare(req.body.password, user.password);
+  if (!passwordMatches) {
+    throw new ApiError(401, "PASSWORD_INCORRECT", "Password is incorrect");
+  }
+
+  await Profile.findByIdAndUpdate(user.additionalDetails, buildProfilePayload(req.body), {
+    new: true,
+    runValidators: true,
+  });
+
+  user.accountStatus = "PENDING";
+  user.approved = false;
+  user.reviewHistory.push({
+    action: "RESUBMITTED",
+    reason: req.body.reason || "Applicant resubmitted registration",
+  });
+  await user.save();
+
+  return res.status(200).json(new ApiResponse("Registration resubmitted successfully", {
+    user: publicUser(user),
+  }));
+});

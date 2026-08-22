@@ -3,12 +3,21 @@ const router = express.Router();
 
 
 const {forgotpasswordToken , forgotPassword} = require('../Controllers/resetPassword')
-const {sendOTP , signUP , login , changePassword} = require('../Controllers/Auth')
-const {googleLogin} = require('../Controllers/googleAuth')
+const {
+  sendOTP,
+  signUP,
+  login,
+  changePassword,
+  refreshAccessToken,
+  logout,
+  listPendingRegistrations,
+  reviewRegistration,
+  resubmitRegistration,
+} = require('../Controllers/Auth')
 
 
 // Middleware
-const {auth , isStudent , isInstructor , isAdmin} = require("../Middlewares/auth")
+const {auth , authorize} = require("../Middlewares/auth")
 
 // Forgot Password
 router.post('/forgotpasswordToken' ,  forgotpasswordToken )
@@ -17,10 +26,13 @@ router.post('/forgotPassword' ,  forgotPassword)
 // Auth Routes
 router.post('/sendOTP' ,  sendOTP)
 router.post('/signUP' , signUP)
+router.post('/register' , signUP)
 router.post('/login' , login)
+router.post('/refresh-token' , refreshAccessToken)
+router.post('/logout' , auth , logout)
 router.post('/changePassword' , auth ,  changePassword)
-
-//google auth
-router.post('/google-login' ,  googleLogin)
+router.put('/registration/resubmit' , resubmitRegistration)
+router.get('/registrations/pending' , auth , authorize('member:verify') , listPendingRegistrations)
+router.patch('/registrations/:userId/review' , auth , authorize('member:verify') , reviewRegistration)
 
 module.exports = router

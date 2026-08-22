@@ -1,10 +1,13 @@
 const jwt = require("jsonwebtoken");
+const ApiError = require("../Utilities/ApiError");
+const { hasPermission } = require("../constants/permissions");
+const User = require("../Models/user");
 require("dotenv").config();
 // auth  check
 exports.auth = async(req , res , next)=>{
     try{
-        console.log( req.body , "authMiddleware")
-        const token = req.body.token || req.cookies.token || req.header("Authorization").replace("Bearer " , "");
+        const authHeader = req.header("Authorization") || "";
+        const token = req.body.token || req.cookies.token || authHeader.replace("Bearer " , "");
         if(!token){
             return res.status(401).json({
                 success:false,
@@ -14,9 +17,38 @@ exports.auth = async(req , res , next)=>{
         
         try{
           
-            const payload = jwt.verify(token , process.env.SECRET_KEY);
-            // console.log(payload)
-            req.user = payload;
+            const payload = jwt.verify(token , process.env.JWT_ACCESS_SECRET || process.env.SECRET_KEY);
+            const user = await User.findById(payload.userId || payload.id).select("roles accountType accountStatus active tokenVersion");
+
+            if (!user) {
+                return res.status(401).json({
+                    success:false,
+                    message:"user no longer exists",
+                })
+            }
+
+            if (!user.active || ["SUSPENDED", "DEACTIVATED"].includes(user.accountStatus)) {
+                return res.status(403).json({
+                    success:false,
+                    message:"account is not active",
+                })
+            }
+
+            if (typeof payload.tokenVersion === "number" && payload.tokenVersion !== user.tokenVersion) {
+                return res.status(401).json({
+                    success:false,
+                    message:"token is no longer valid",
+                })
+            }
+
+            req.user = {
+                ...payload,
+                id: String(user._id),
+                userId: String(user._id),
+                roles: user.roles,
+                accountType: user.accountType,
+                accountStatus: user.accountStatus,
+            };
 
             // console.log(req.body)
 
@@ -41,6 +73,18 @@ exports.auth = async(req , res , next)=>{
 
     }
 }
+
+exports.authorize = (permission) => {
+    return (req, res, next) => {
+        const roles = req.user?.roles || req.user?.accountType || [];
+
+        if (!hasPermission(roles, permission)) {
+            return next(new ApiError(403, "FORBIDDEN", "You do not have permission to perform this action"));
+        }
+
+        next();
+    };
+};
 
 // checked
 // isstudent

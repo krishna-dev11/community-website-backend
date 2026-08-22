@@ -1,13 +1,14 @@
 const express = require("express")
 const router = express.Router();
 
-const {updateProfile , getAllUserDetails , updateDisplayPicture , deleteAccount} = require('../Controllers/Profile')
+const {updateProfile , getAllUserDetails , updateDisplayPicture , deleteAccount, searchMemberDirectory} = require('../Controllers/Profile')
 // Middleware
 const {auth , isStudent , isInstructor , isAdmin} = require("../Middlewares/auth")
 
 
 router.put('/updateProfile' , auth ,  updateProfile)
 router.get('/getAllUserDetails' , auth ,  getAllUserDetails)
+router.get('/directory' , auth ,  searchMemberDirectory)
 router.put('/updateDisplayPicture' , auth ,  updateDisplayPicture)
 router.delete('/deleteAccount' , auth ,  deleteAccount)
 
