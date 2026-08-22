@@ -8,6 +8,10 @@ const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
 const { notifyUser } = require("../Utilities/notificationService");
+const {
+  uploadImageToCloudinary,
+  assetMetadata,
+} = require("../Utilities/uploadImageToCloudinary");
 
 function pageOptions(query) {
   const page = Math.max(Number(query.page) || 1, 1);
@@ -46,12 +50,34 @@ function profilePayload(body) {
     "about",
     "expectations",
     "familyDetails",
-    "protectedContact",
-    "guardian",
     "visibility",
   ].forEach((field) => {
     if (body[field] !== undefined) payload[field] = body[field];
   });
+
+  if (body.protectedContact) {
+    payload.protectedContact = typeof body.protectedContact === "string"
+      ? JSON.parse(body.protectedContact || "{}")
+      : body.protectedContact;
+  } else if (body.phone || body.email || body.address) {
+    payload.protectedContact = {
+      phone: body.phone,
+      email: body.email,
+      address: body.address,
+    };
+  }
+
+  if (body.guardian) {
+    payload.guardian = typeof body.guardian === "string"
+      ? JSON.parse(body.guardian || "{}")
+      : body.guardian;
+  } else if (body.guardianName || body.guardianRelation || body.guardianPhone) {
+    payload.guardian = {
+      name: body.guardianName,
+      relation: body.guardianRelation,
+      phone: body.guardianPhone,
+    };
+  }
 
   if (Array.isArray(body.photos)) {
     payload.photos = body.photos.map(assetFromBody).filter(Boolean);
@@ -98,6 +124,15 @@ exports.createOrUpdateMyMatrimonialProfile = asyncHandler(async (req, res) => {
   const payload = profilePayload(req.body);
   if (!payload.displayName || !payload.gender || !payload.dateOfBirth) {
     throw new ApiError(400, "MATRIMONIAL_PROFILE_FIELDS_REQUIRED", "Display name, gender, and date of birth are required");
+  }
+
+  // Handle actual photo file upload (replaces URL-only approach)
+  const photoFile = req.files?.photo || req.files?.profilePhoto || req.files?.photos;
+  if (photoFile) {
+    const uploadResult = await uploadImageToCloudinary(photoFile, "samaj/matrimonial", 1200, 80);
+    const photoAsset = assetMetadata(uploadResult, photoFile.name);
+    // Prepend uploaded photo to any existing body photos
+    payload.photos = [photoAsset, ...(payload.photos || [])];
   }
 
   const existing = await MatrimonialProfile.findOne({ owner: req.user.id });

@@ -16,6 +16,10 @@ const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
+const {
+  uploadImageToCloudinary,
+  assetMetadata,
+} = require("../Utilities/uploadImageToCloudinary");
 
 function pageOptions(query) {
   const page = Math.max(Number(query.page) || 1, 1);
@@ -660,8 +664,27 @@ function createReviewableHandlers(Model, publicName, fields) {
       fields.forEach((field) => {
         if (req.body[field] !== undefined) payload[field] = req.body[field];
       });
-      if (publicName === "achievement") payload.image = assetFromBody(req.body.image);
-      if (publicName === "shradhanjali") payload.photo = assetFromBody(req.body.photo);
+
+      if (publicName === "achievement") {
+        const imageFile = req.files?.image || req.files?.achievementImage || req.files?.photo;
+        if (imageFile) {
+          const uploadResult = await uploadImageToCloudinary(imageFile, "samaj/achievements");
+          payload.image = assetMetadata(uploadResult, imageFile.name);
+        } else if (req.body.image) {
+          payload.image = assetFromBody(req.body.image);
+        }
+      }
+
+      if (publicName === "shradhanjali") {
+        const photoFile = req.files?.photo || req.files?.tributePhoto || req.files?.image;
+        if (photoFile) {
+          const uploadResult = await uploadImageToCloudinary(photoFile, "samaj/shradhanjali");
+          payload.photo = assetMetadata(uploadResult, photoFile.name);
+        } else if (req.body.photo) {
+          payload.photo = assetFromBody(req.body.photo);
+        }
+      }
+
       const item = await Model.create({ ...payload, submittedBy: req.user.id });
       return res.status(201).json(new ApiResponse(`${publicName} submitted successfully`, { [publicName]: item }));
     }),

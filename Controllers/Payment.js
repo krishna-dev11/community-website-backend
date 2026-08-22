@@ -122,14 +122,37 @@ exports.listDonationCampaignsAdmin = asyncHandler(async (req, res) => {
   return res.status(200).json(new ApiResponse("Admin donation campaigns fetched successfully", { campaigns: items }, meta));
 });
 
+const { uploadImageToCloudinary, assetMetadata } = require("../Utilities/uploadImageToCloudinary");
+
+function assetFromBody(asset) {
+  if (!asset?.url) return undefined;
+  return {
+    url: asset.url,
+    publicId: asset.publicId,
+    size: asset.size,
+    mimeType: asset.mimeType,
+    name: asset.name,
+  };
+}
+
 exports.createDonationCampaign = asyncHandler(async (req, res) => {
   if (!req.body.title || !req.body.description) {
     throw new ApiError(400, "CAMPAIGN_FIELDS_REQUIRED", "Title and description are required");
   }
   ensureFutureDate(req.body.endDate, "INVALID_CAMPAIGN_END_DATE", "Campaign end date must be in the future");
 
+  const payload = campaignPayload(req.body);
+
+  const coverFile = req.files?.coverImage || req.files?.image;
+  if (coverFile) {
+    const uploadResult = await uploadImageToCloudinary(coverFile, "samaj/donations", 1000, 1000);
+    payload.coverImage = assetMetadata(uploadResult, coverFile.name);
+  } else if (req.body.coverImage) {
+    payload.coverImage = assetFromBody(req.body.coverImage);
+  }
+
   const campaign = await DonationCampaign.create({
-    ...campaignPayload(req.body),
+    ...payload,
     createdBy: req.user.id,
     updatedBy: req.user.id,
   });

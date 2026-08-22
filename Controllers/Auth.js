@@ -2,6 +2,7 @@ const crypto = require("node:crypto");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const otpGenerator = require("otp-generator");
+const cloudinary = require("cloudinary").v2;
 const User = require("../Models/user");
 const OTP = require("../Models/otpSchema");
 const Profile = require("../Models/profile");
@@ -12,6 +13,11 @@ const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
 const { notifyUser } = require("../Utilities/notificationService");
+const {
+  uploadImageToCloudinary,
+  uploadDocumentToCloudinary,
+  assetMetadata,
+} = require("../Utilities/uploadImageToCloudinary");
 require("dotenv").config();
 
 const ACCESS_TOKEN_TTL = "15m";
@@ -180,7 +186,26 @@ exports.signUP = asyncHandler(async (req, res) => {
   }
 
   const hashedPassword = await bcrypt.hash(password, 12);
-  const profileDetails = await Profile.create(buildProfilePayload(req.body));
+  const profilePayload = buildProfilePayload(req.body);
+
+  let uploadedPhotoUrl = null;
+
+  // Handle actual document file upload (e.g. Aadhar / Samaj ID)
+  const docFile = req.files?.identityDocument || req.files?.document || req.files?.verificationDocument;
+  if (docFile) {
+    const docUpload = await uploadDocumentToCloudinary(docFile, "samaj/documents", true);
+    profilePayload.identityDocument = assetMetadata(docUpload, docFile.name);
+  }
+
+  // Handle actual profile photo file upload
+  const photoFile = req.files?.photo || req.files?.profilePhoto || req.files?.displayPicture;
+  if (photoFile) {
+    const photoUpload = await uploadImageToCloudinary(photoFile, "samaj/profile", 1000, 1000);
+    profilePayload.photo = assetMetadata(photoUpload, photoFile.name);
+    uploadedPhotoUrl = photoUpload.secure_url;
+  }
+
+  const profileDetails = await Profile.create(profilePayload);
   const createdUser = await User.create({
     firstName,
     lastName,
@@ -190,11 +215,11 @@ exports.signUP = asyncHandler(async (req, res) => {
     accountStatus: "PENDING",
     approved: false,
     password: hashedPassword,
-    imageUrl: `https://api.dicebear.com/5.x/initials/svg?seed=${firstName}-${lastName}`,
+    imageUrl: uploadedPhotoUrl || `https://api.dicebear.com/5.x/initials/svg?seed=${firstName}-${lastName}`,
     additionalDetails: profileDetails._id,
     reviewHistory: [{
       action: "SUBMITTED",
-      reason: "Registration submitted",
+      reason: "Registration submitted with verification document",
     }],
   });
 
@@ -414,6 +439,41 @@ exports.reviewRegistration = asyncHandler(async (req, res) => {
   }));
 });
 
+exports.getRegistrationDocument = asyncHandler(async (req, res) => {
+  const { userId } = req.params;
+
+  const user = await User.findById(userId).populate("additionalDetails");
+  if (!user) {
+    throw new ApiError(404, "USER_NOT_FOUND", "Member was not found");
+  }
+
+  const identityDocument = user.additionalDetails?.identityDocument;
+  if (!identityDocument?.publicId) {
+    throw new ApiError(404, "DOCUMENT_NOT_FOUND", "No verification document was uploaded for this member");
+  }
+
+  // Generate a short-lived signed URL (5 minutes) for the private/authenticated Cloudinary asset
+  const expiresAt = Math.floor(Date.now() / 1000) + 300; // 5 minutes
+  const signedUrl = cloudinary.url(identityDocument.publicId, {
+    type: "authenticated",
+    sign_url: true,
+    expires_at: expiresAt,
+    resource_type: "image",
+    secure: true,
+  });
+
+  return res.status(200).json(new ApiResponse("Document URL generated", {
+    signedUrl,
+    expiresIn: 300,
+    documentMeta: {
+      name: identityDocument.name || "Identity Document",
+      mimeType: identityDocument.mimeType,
+      size: identityDocument.size,
+      uploadedAt: identityDocument.uploadedAt,
+    },
+  }));
+});
+
 exports.resubmitRegistration = asyncHandler(async (req, res) => {
   const email = normalizeEmail(req.body.email);
 
@@ -432,7 +492,22 @@ exports.resubmitRegistration = asyncHandler(async (req, res) => {
     throw new ApiError(401, "PASSWORD_INCORRECT", "Password is incorrect");
   }
 
-  await Profile.findByIdAndUpdate(user.additionalDetails, buildProfilePayload(req.body), {
+  const profilePayload = buildProfilePayload(req.body);
+
+  const docFile = req.files?.identityDocument || req.files?.document || req.files?.verificationDocument;
+  if (docFile) {
+    const docUpload = await uploadDocumentToCloudinary(docFile, "samaj/documents", true);
+    profilePayload.identityDocument = assetMetadata(docUpload, docFile.name);
+  }
+
+  const photoFile = req.files?.photo || req.files?.profilePhoto || req.files?.displayPicture;
+  if (photoFile) {
+    const photoUpload = await uploadImageToCloudinary(photoFile, "samaj/profile", 1000, 1000);
+    profilePayload.photo = assetMetadata(photoUpload, photoFile.name);
+    user.imageUrl = photoUpload.secure_url;
+  }
+
+  await Profile.findByIdAndUpdate(user.additionalDetails, profilePayload, {
     new: true,
     runValidators: true,
   });
@@ -441,7 +516,7 @@ exports.resubmitRegistration = asyncHandler(async (req, res) => {
   user.approved = false;
   user.reviewHistory.push({
     action: "RESUBMITTED",
-    reason: req.body.reason || "Applicant resubmitted registration",
+    reason: req.body.reason || "Applicant resubmitted registration with updated document",
   });
   await user.save();
 

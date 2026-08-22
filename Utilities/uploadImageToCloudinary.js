@@ -1,90 +1,120 @@
-const cloudinary = require('cloudinary').v2;
+const cloudinary = require("cloudinary").v2;
+const ApiError = require("./ApiError");
 
-exports.uploadImageToCloudinary = async(file , folder , height , quality)=>
-{
-    try{
+const ALLOWED_IMAGE_MIMES = [
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+];
 
-        const options = {folder};
+const ALLOWED_DOC_MIMES = [
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "application/pdf",
+];
 
-        if(quality){
-            options.quality = quality;
-        }
+function validateUploadFile(file, { maxSizeMB = 10, allowedMimes = ALLOWED_IMAGE_MIMES } = {}) {
+  if (!file) {
+    throw new ApiError(400, "FILE_REQUIRED", "Please select a file to upload");
+  }
 
-        if(height){
-            options.height = height;
-        }
+  const mime = file.mimetype || file.type || "";
+  if (!allowedMimes.includes(mime.toLowerCase())) {
+    throw new ApiError(
+      400,
+      "INVALID_FILE_TYPE",
+      `Invalid file format: ${mime}. Allowed formats: ${allowedMimes.map((m) => m.split("/")[1] || m).join(", ")}`
+    );
+  }
 
-        options.resource_type = "auto";
+  const maxBytes = maxSizeMB * 1024 * 1024;
+  if (file.size && file.size > maxBytes) {
+    throw new ApiError(
+      400,
+      "FILE_TOO_LARGE",
+      `File size exceeds maximum allowed limit of ${maxSizeMB}MB`
+    );
+  }
 
-      return await cloudinary.uploader.upload(file.tempFilePath , options);
-
-    }catch(error){
-       console.error = error;
-    }
+  return true;
 }
 
+async function uploadImageToCloudinary(file, folder = "samaj/general", height, quality, isPrivate = false) {
+  try {
+    validateUploadFile(file, { maxSizeMB: 10, allowedMimes: ALLOWED_IMAGE_MIMES });
 
+    const options = {
+      folder,
+      resource_type: "auto",
+    };
 
-// ye mene likha hai so confirm karna hai 
-// const cloudinary = require('cloudinary').v2;
+    if (quality) options.quality = quality;
+    if (height) options.height = height;
+    if (isPrivate) {
+      options.type = "authenticated";
+    }
 
-// exports.updateVideoTOCloudinary = async(file , folder , publicId , height , quality)=>
-// {
-//     try{
+    const filePath = file.tempFilePath || file.path;
+    if (!filePath) {
+      throw new ApiError(400, "FILE_READ_ERROR", "Uploaded file temporary path not found");
+    }
 
-//         const options = {folder};
+    const result = await cloudinary.uploader.upload(filePath, options);
+    return result;
+  } catch (error) {
+    console.error("Cloudinary upload error:", error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(500, "UPLOAD_FAILED", error.message || "Failed to upload image to Cloudinary");
+  }
+}
 
-//         if(quality){
-//             options.quality = quality;
-//         }
+async function uploadDocumentToCloudinary(file, folder = "samaj/documents", isPrivate = true) {
+  try {
+    validateUploadFile(file, { maxSizeMB: 15, allowedMimes: ALLOWED_DOC_MIMES });
 
-//         if(height){
-//             options.height = height;
-//         }
+    const options = {
+      folder,
+      resource_type: "auto",
+    };
 
-//         if(publicId){
-//             options.public_id = publicId,
-//             options.overwrite = true
-//         }
+    if (isPrivate) {
+      options.type = "authenticated";
+    }
 
-//         options.resource_type = "auto";
+    const filePath = file.tempFilePath || file.path;
+    if (!filePath) {
+      throw new ApiError(400, "FILE_READ_ERROR", "Uploaded document temporary path not found");
+    }
 
-//         await cloudinary.uploader.upload(file.tempFilePath , options);
+    const result = await cloudinary.uploader.upload(filePath, options);
+    return result;
+  } catch (error) {
+    console.error("Cloudinary document upload error:", error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(500, "UPLOAD_FAILED", error.message || "Failed to upload document to Cloudinary");
+  }
+}
 
-//     }catch(error){
-//        console.error = error;
-//     }
-// }
+function assetMetadata(uploadResult, originalName) {
+  if (!uploadResult) return undefined;
+  return {
+    url: uploadResult.secure_url || uploadResult.url,
+    publicId: uploadResult.public_id,
+    size: uploadResult.bytes || uploadResult.size,
+    mimeType: uploadResult.format ? `image/${uploadResult.format}` : uploadResult.resource_type,
+    name: originalName || uploadResult.original_filename || "Uploaded File",
+    uploadedAt: new Date(),
+  };
+}
 
-
-
-
-// const cloudinary = require('cloudinary').v2;
-
-// exports.deleteVideoTOCloudinary = async( publicId )=>
-// {
-//     try{
-
-//         const options = {folder};
-
-//         // if(quality){
-//         //     options.quality = quality;
-//         // }
-
-//         // if(height){
-//         //     options.height = height;
-//         // }
-
-//         if(publicId){
-//             options.public_id = publicId,
-//             options.overwrite = true
-//         }
-
-//         options.resource_type = "auto";
-
-//         await cloudinary.uploader.destroy(file.tempFilePath , options);
-
-//     }catch(error){
-//        console.error = error;
-//     }
-// }
+module.exports = {
+  ALLOWED_IMAGE_MIMES,
+  ALLOWED_DOC_MIMES,
+  validateUploadFile,
+  uploadImageToCloudinary,
+  uploadDocumentToCloudinary,
+  assetMetadata,
+};

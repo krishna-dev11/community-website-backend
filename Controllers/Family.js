@@ -2,12 +2,14 @@ const crypto = require("node:crypto");
 const Family = require("../Models/family");
 const FamilyMembership = require("../Models/familyMembership");
 const FamilyJoinRequest = require("../Models/familyJoinRequest");
+const FamilyMemberNode = require("../Models/familyMemberNode");
 const User = require("../Models/user");
 const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
 const { notifyUser } = require("../Utilities/notificationService");
+const { uploadImageToCloudinary, assetMetadata } = require("../Utilities/uploadImageToCloudinary");
 
 function generateFamilyCode() {
   return `FAM-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
@@ -330,4 +332,261 @@ exports.transferFamilyAdmin = asyncHandler(async (req, res) => {
   });
 
   return res.status(200).json(new ApiResponse("Family admin transferred successfully"));
+});
+
+exports.getFamilyTree = asyncHandler(async (req, res) => {
+  const { familyId } = req.params;
+
+  const family = await Family.findById(familyId)
+    .populate("currentFamilyAdmin", "firstName lastName email imageUrl");
+
+  if (!family || family.isArchived) {
+    throw new ApiError(404, "FAMILY_NOT_FOUND", "Family was not found or has been archived");
+  }
+
+  // Fetch all tree nodes for this family
+  let nodes = await FamilyMemberNode.find({ family: familyId })
+    .populate("linkedUser", "firstName lastName email imageUrl additionalDetails")
+    .populate("parents", "name relation gender photo")
+    .populate("spouse", "name relation gender photo")
+    .sort({ generation: 1, createdAt: 1 });
+
+  // If no nodes exist yet, auto-bootstrap tree nodes from active family members
+  if (nodes.length === 0) {
+    const activeMemberships = await FamilyMembership.find({
+      family: familyId,
+      status: "ACTIVE",
+    }).populate({
+      path: "member",
+      select: "firstName lastName email imageUrl additionalDetails",
+      populate: { path: "additionalDetails" },
+    });
+
+    const bootstrapNodes = [];
+    for (const membership of activeMemberships) {
+      const u = membership.member;
+      if (!u) continue;
+      const isAdmin = String(family.currentFamilyAdmin?._id || family.currentFamilyAdmin) === String(u._id);
+      bootstrapNodes.push({
+        family: familyId,
+        name: `${u.firstName || ""} ${u.lastName || ""}`.trim() || "Family Member",
+        gender: u.additionalDetails?.gender || "MALE",
+        relation: isAdmin ? "SELF" : "OTHER",
+        generation: 0,
+        linkedUser: u._id,
+        photo: u.imageUrl ? { url: u.imageUrl, name: `${u.firstName} photo` } : undefined,
+        currentCity: u.additionalDetails?.currentCity,
+        nativePlace: u.additionalDetails?.nativePlace,
+        profession: u.additionalDetails?.profession,
+        createdBy: req.user.id,
+      });
+    }
+
+    if (bootstrapNodes.length > 0) {
+      await FamilyMemberNode.insertMany(bootstrapNodes);
+      nodes = await FamilyMemberNode.find({ family: familyId })
+        .populate("linkedUser", "firstName lastName email imageUrl additionalDetails")
+        .sort({ generation: 1, createdAt: 1 });
+    }
+  }
+
+  // Structure nodes by generation
+  const generationMap = {
+    "-2": { title: "Grandparents Generation", nodes: [] },
+    "-1": { title: "Parents Generation", nodes: [] },
+    "0": { title: "Self & Siblings Generation", nodes: [] },
+    "1": { title: "Children Generation", nodes: [] },
+    "2": { title: "Grandchildren Generation", nodes: [] },
+  };
+
+  nodes.forEach((node) => {
+    const genKey = String(node.generation ?? 0);
+    if (!generationMap[genKey]) {
+      generationMap[genKey] = { title: `Generation ${genKey}`, nodes: [] };
+    }
+    generationMap[genKey].nodes.push(node);
+  });
+
+  return res.status(200).json(
+    new ApiResponse("Family tree fetched successfully", {
+      family,
+      nodes,
+      generationMap,
+      totalMembersInTree: nodes.length,
+    })
+  );
+});
+
+exports.addFamilyTreeNode = asyncHandler(async (req, res) => {
+  const { familyId } = req.params;
+  const {
+    name,
+    gender,
+    relation,
+    generation,
+    linkedUser,
+    birthYear,
+    passedAwayYear,
+    isDeceased,
+    profession,
+    currentCity,
+    nativePlace,
+    about,
+    parents,
+    spouse,
+  } = req.body;
+
+  if (!name) {
+    throw new ApiError(400, "NAME_REQUIRED", "Relative name is required");
+  }
+
+  const family = await Family.findById(familyId);
+  if (!family || family.isArchived) {
+    throw new ApiError(404, "FAMILY_NOT_FOUND", "Family was not found");
+  }
+
+  // Check user belongs to family
+  const membership = await FamilyMembership.findOne({
+    family: familyId,
+    member: req.user.id,
+    status: "ACTIVE",
+  });
+
+  if (!membership) {
+    throw new ApiError(403, "FAMILY_MEMBER_REQUIRED", "You must belong to this family to modify the tree");
+  }
+
+  const nodeData = {
+    family: familyId,
+    name: name.trim(),
+    gender: gender || "MALE",
+    relation: relation || "OTHER",
+    generation: Number(generation !== undefined ? generation : 0),
+    linkedUser: linkedUser || undefined,
+    birthYear: birthYear ? Number(birthYear) : undefined,
+    passedAwayYear: passedAwayYear ? Number(passedAwayYear) : undefined,
+    isDeceased: Boolean(isDeceased === "true" || isDeceased === true),
+    profession: profession?.trim() || undefined,
+    currentCity: currentCity?.trim() || undefined,
+    nativePlace: nativePlace?.trim() || undefined,
+    about: about?.trim() || undefined,
+    spouse: spouse || undefined,
+    createdBy: req.user.id,
+  };
+
+  if (parents) {
+    nodeData.parents = Array.isArray(parents) ? parents : [parents];
+  }
+
+  // Handle uploaded relative photo
+  const photoFile = req.files?.photo || req.files?.image;
+  if (photoFile) {
+    const uploadResult = await uploadImageToCloudinary(photoFile, "samaj/family_tree", 800, 80);
+    nodeData.photo = assetMetadata(uploadResult, photoFile.name);
+  }
+
+  const node = await FamilyMemberNode.create(nodeData);
+
+  // If spouse node is specified, link back reciprocally
+  if (spouse) {
+    await FamilyMemberNode.findByIdAndUpdate(spouse, { spouse: node._id });
+  }
+
+  await logAudit({
+    actor: req.user.id,
+    action: "family.tree.node_created",
+    targetType: "familyMemberNode",
+    target: node._id,
+    newValue: { name: node.name, relation: node.relation, family: familyId },
+    req,
+  });
+
+  return res.status(201).json(new ApiResponse("Family member added to tree", { node }));
+});
+
+exports.updateFamilyTreeNode = asyncHandler(async (req, res) => {
+  const { familyId, nodeId } = req.params;
+
+  const node = await FamilyMemberNode.findOne({ _id: nodeId, family: familyId });
+  if (!node) {
+    throw new ApiError(404, "NODE_NOT_FOUND", "Tree member node was not found");
+  }
+
+  // Check membership
+  const membership = await FamilyMembership.findOne({
+    family: familyId,
+    member: req.user.id,
+    status: "ACTIVE",
+  });
+  if (!membership) {
+    throw new ApiError(403, "FAMILY_MEMBER_REQUIRED", "Access denied");
+  }
+
+  const updateFields = [
+    "name",
+    "gender",
+    "relation",
+    "generation",
+    "birthYear",
+    "passedAwayYear",
+    "isDeceased",
+    "profession",
+    "currentCity",
+    "nativePlace",
+    "about",
+    "spouse",
+  ];
+
+  updateFields.forEach((field) => {
+    if (req.body[field] !== undefined) {
+      if (field === "generation" || field === "birthYear" || field === "passedAwayYear") {
+        node[field] = req.body[field] ? Number(req.body[field]) : undefined;
+      } else if (field === "isDeceased") {
+        node.isDeceased = Boolean(req.body.isDeceased === "true" || req.body.isDeceased === true);
+      } else {
+        node[field] = req.body[field];
+      }
+    }
+  });
+
+  if (req.body.parents) {
+    node.parents = Array.isArray(req.body.parents) ? req.body.parents : [req.body.parents];
+  }
+
+  // Handle updated photo
+  const photoFile = req.files?.photo || req.files?.image;
+  if (photoFile) {
+    const uploadResult = await uploadImageToCloudinary(photoFile, "samaj/family_tree", 800, 80);
+    node.photo = assetMetadata(uploadResult, photoFile.name);
+  }
+
+  await node.save();
+
+  return res.status(200).json(new ApiResponse("Family tree member updated", { node }));
+});
+
+exports.deleteFamilyTreeNode = asyncHandler(async (req, res) => {
+  const { familyId, nodeId } = req.params;
+
+  await requireFamilyAdmin(req.user.id, familyId);
+
+  const node = await FamilyMemberNode.findOneAndDelete({ _id: nodeId, family: familyId });
+  if (!node) {
+    throw new ApiError(404, "NODE_NOT_FOUND", "Tree member node was not found");
+  }
+
+  // Remove references
+  await FamilyMemberNode.updateMany({ family: familyId, spouse: nodeId }, { $unset: { spouse: 1 } });
+  await FamilyMemberNode.updateMany({ family: familyId, parents: nodeId }, { $pull: { parents: nodeId } });
+
+  await logAudit({
+    actor: req.user.id,
+    action: "family.tree.node_deleted",
+    targetType: "familyMemberNode",
+    target: nodeId,
+    oldValue: { name: node.name, family: familyId },
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Family tree member removed"));
 });

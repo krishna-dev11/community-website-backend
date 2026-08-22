@@ -13,6 +13,7 @@ const {
   listPendingRegistrations,
   reviewRegistration,
   resubmitRegistration,
+  getRegistrationDocument,
 } = require('../Controllers/Auth')
 
 
@@ -34,5 +35,6 @@ router.post('/changePassword' , auth ,  changePassword)
 router.put('/registration/resubmit' , resubmitRegistration)
 router.get('/registrations/pending' , auth , authorize('member:verify') , listPendingRegistrations)
 router.patch('/registrations/:userId/review' , auth , authorize('member:verify') , reviewRegistration)
+router.get('/registrations/:userId/document' , auth , authorize('member:verify') , getRegistrationDocument)
 
 module.exports = router
