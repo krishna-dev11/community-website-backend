@@ -6,6 +6,7 @@ const {
   updateDonationCampaign,
   archiveDonationCampaign,
   createDonationOrder,
+  verifyDonationPayment,
   listDonations,
   createContributionOrder,
   razorpayWebhook,
@@ -28,6 +29,7 @@ router.patch("/donation-campaigns/:campaignId", auth, authorize("donation:update
 router.patch("/donation-campaigns/:campaignId/archive", auth, authorize("donation:archive"), archiveDonationCampaign);
 
 router.post("/donations/orders", auth, createDonationOrder);
+router.post("/donations/verify", auth, verifyDonationPayment);
 router.get("/donations", auth, authorize("donation:read"), listDonations);
 router.get("/me/donations", auth, (req, res, next) => {
   req.query.mine = "true";

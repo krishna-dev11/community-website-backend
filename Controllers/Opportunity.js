@@ -286,6 +286,16 @@ exports.listJobApplications = asyncHandler(async (req, res) => {
   return res.status(200).json(new ApiResponse("Job applications fetched successfully", { applications: items }, meta));
 });
 
+exports.listMyJobApplications = asyncHandler(async (req, res) => {
+  const filter = { applicant: req.user.id };
+  if (req.query.status) filter.status = req.query.status;
+  const { items, meta } = await paged(JobApplication, filter, req.query, { createdAt: -1 }, {
+    path: "job",
+    select: "title companyName location employmentType status",
+  });
+  return res.status(200).json(new ApiResponse("My job applications fetched successfully", { applications: items }, meta));
+});
+
 exports.updateJobApplicationStatus = asyncHandler(async (req, res) => {
   const { status, reviewMessage } = req.body;
   if (!["SHORTLISTED", "INTERVIEW", "SELECTED", "REJECTED", "WITHDRAWN"].includes(status)) {

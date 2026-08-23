@@ -66,10 +66,18 @@ exports.createAdminInvite = asyncHandler(async (req, res) => {
     throw new ApiError(400, "INVALID_ADMIN_ROLE", `Invalid admin role(s): ${invalidRoles.join(", ")}`);
   }
 
+  // Only SUPER_ADMIN can invite another SUPER_ADMIN
+  if (roles.includes("SUPER_ADMIN") && !req.user.roles?.includes("SUPER_ADMIN")) {
+    throw new ApiError(403, "FORBIDDEN", "Only Super Admins are authorized to grant Super Admin privileges");
+  }
+
   const existingUser = await User.findOne({ email });
   if (existingUser?.accountStatus === "ACTIVE") {
     throw new ApiError(409, "ADMIN_EMAIL_ALREADY_ACTIVE", "An active user already exists with this email");
   }
+
+  // Revoke any previous pending invites for this email to prevent duplicates
+  await AdminInvite.updateMany({ email, status: "PENDING" }, { status: "REVOKED" });
 
   const rawToken = crypto.randomBytes(32).toString("hex");
   const invite = await AdminInvite.create({
@@ -83,11 +91,16 @@ exports.createAdminInvite = asyncHandler(async (req, res) => {
   const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
   const url = `${frontendUrl}/admin-invite/${rawToken}`;
 
-  await mailSender(
-    email,
-    "Samaj Community Platform admin invite",
-    adminInviteEmail({ email, roles, url })
-  );
+  try {
+    await mailSender(
+      email,
+      "Samaj Community Platform — Administrator Invitation",
+      adminInviteEmail({ email, roles, url })
+    );
+  } catch (mailError) {
+    console.error(`[Admin.js] Invitation created (ID: ${invite._id}) but email sending failed:`, mailError.message);
+    // Keep invite valid so admin can share URL manually or retry, but inform in response
+  }
 
   await logAudit({
     actor: req.user.id,

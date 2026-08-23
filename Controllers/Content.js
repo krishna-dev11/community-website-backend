@@ -9,7 +9,7 @@ const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
-const { uploadImageToCloudinary } = require("../Utilities/uploadImageToCloudinary");
+const { uploadImageToCloudinary, uploadPublicationPdf } = require("../Utilities/uploadImageToCloudinary");
 
 function pageOptions(query) {
   const page = Math.max(Number(query.page) || 1, 1);
@@ -88,6 +88,18 @@ async function uploadFiles(files, folder) {
       throw new ApiError(500, "FILE_UPLOAD_FAILED", "Could not upload file");
     }
     uploaded.push(assetFromCloudinary(result, file.name));
+  }
+  return uploaded;
+}
+
+async function uploadPublicationFiles(files, folder) {
+  const uploaded = [];
+  for (const file of asArray(files)) {
+    const result = await uploadPublicationPdf(file, folder);
+    if (!result?.secure_url) {
+      throw new ApiError(500, "FILE_UPLOAD_FAILED", "Could not upload publication file");
+    }
+    uploaded.push(assetFromCloudinary(result, file.originalname || file.name));
   }
   return uploaded;
 }
@@ -269,7 +281,9 @@ exports.listPublicationsAdmin = asyncHandler(async (req, res) => {
 });
 
 exports.createPublication = asyncHandler(async (req, res) => {
-  const fileUpload = (await uploadFiles(req.files?.file, process.env.CLOUDINARY_PUBLICATION_FOLDER || "samaj/publications"))[0];
+  // PDF goes through uploadPublicationPdf (supports application/pdf)
+  // Cover image goes through uploadImageToCloudinary (images only)
+  const fileUpload = (await uploadPublicationFiles(req.files?.file, process.env.CLOUDINARY_PUBLICATION_FOLDER || "samaj/publications"))[0];
   const coverUpload = (await uploadFiles(req.files?.coverImage, process.env.CLOUDINARY_PUBLICATION_FOLDER || "samaj/publications/covers"))[0];
   const file = fileUpload || assetFromBody(req.body.file);
   const coverImage = coverUpload || assetFromBody(req.body.coverImage);
@@ -303,7 +317,7 @@ exports.updatePublication = asyncHandler(async (req, res) => {
   }
 
   const oldStatus = publication.status;
-  const nextFile = (await uploadFiles(req.files?.file, process.env.CLOUDINARY_PUBLICATION_FOLDER || "samaj/publications"))[0] || assetFromBody(req.body.file);
+  const nextFile = (await uploadPublicationFiles(req.files?.file, process.env.CLOUDINARY_PUBLICATION_FOLDER || "samaj/publications"))[0] || assetFromBody(req.body.file);
   const nextCover = (await uploadFiles(req.files?.coverImage, process.env.CLOUDINARY_PUBLICATION_FOLDER || "samaj/publications/covers"))[0] || assetFromBody(req.body.coverImage);
 
   Object.assign(publication, publicationPayload(req.body), { updatedBy: req.user.id });

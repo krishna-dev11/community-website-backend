@@ -21,12 +21,19 @@ function validateUploadFile(file, { maxSizeMB = 10, allowedMimes = ALLOWED_IMAGE
     throw new ApiError(400, "FILE_REQUIRED", "Please select a file to upload");
   }
 
-  const mime = file.mimetype || file.type || "";
-  if (!allowedMimes.includes(mime.toLowerCase())) {
+  const mime = (file.mimetype || file.type || "").toLowerCase();
+  const fileName = (file.name || file.originalname || "").toLowerCase();
+  const fileExt = fileName.split(".").pop();
+
+  const isMimeAllowed = allowedMimes.includes(mime);
+  const isPdfExtension = (fileExt === "pdf") && allowedMimes.includes("application/pdf");
+  const isImageExtension = ["jpg", "jpeg", "png", "webp"].includes(fileExt) && allowedMimes.some(m => m.startsWith("image/"));
+
+  if (!isMimeAllowed && !isPdfExtension && !isImageExtension) {
     throw new ApiError(
       400,
       "INVALID_FILE_TYPE",
-      `Invalid file format: ${mime}. Allowed formats: ${allowedMimes.map((m) => m.split("/")[1] || m).join(", ")}`
+      `Invalid file format: ${mime || fileExt}. Allowed formats: ${allowedMimes.map((m) => m.split("/")[1] || m).join(", ")}`
     );
   }
 
@@ -110,11 +117,49 @@ function assetMetadata(uploadResult, originalName) {
   };
 }
 
+const ALLOWED_PUBLICATION_MIMES = [
+  "application/pdf",
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+];
+
+async function uploadPublicationPdf(file, folder = "samaj/publications") {
+  try {
+    validateUploadFile(file, { maxSizeMB: 20, allowedMimes: ALLOWED_PUBLICATION_MIMES });
+
+    const isPdf = (file.mimetype === "application/pdf") || (file.name || "").toLowerCase().endsWith(".pdf");
+
+    const options = {
+      folder,
+      resource_type: isPdf ? "raw" : "auto",
+      type: "upload",
+      use_filename: true,
+      unique_filename: true,
+    };
+
+    const filePath = file.tempFilePath || file.path;
+    if (!filePath) {
+      throw new ApiError(400, "FILE_READ_ERROR", "Uploaded file temporary path not found");
+    }
+
+    const result = await cloudinary.uploader.upload(filePath, options);
+    return result;
+  } catch (error) {
+    console.error("Cloudinary publication upload error:", error);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(500, "UPLOAD_FAILED", error.message || "Failed to upload publication file to Cloudinary");
+  }
+}
+
 module.exports = {
   ALLOWED_IMAGE_MIMES,
   ALLOWED_DOC_MIMES,
+  ALLOWED_PUBLICATION_MIMES,
   validateUploadFile,
   uploadImageToCloudinary,
   uploadDocumentToCloudinary,
+  uploadPublicationPdf,
   assetMetadata,
 };

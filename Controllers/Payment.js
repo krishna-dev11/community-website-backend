@@ -267,6 +267,68 @@ exports.createDonationOrder = asyncHandler(async (req, res) => {
   }));
 });
 
+exports.verifyDonationPayment = asyncHandler(async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+  if (!razorpay_order_id || !razorpay_payment_id) {
+    throw new ApiError(400, "PAYMENT_DETAILS_REQUIRED", "Order ID and Payment ID are required");
+  }
+
+  const secret = process.env.RAZORPAY_SECRET || process.env.RAZORPAY_KEY_SECRET;
+  if (secret && razorpay_signature) {
+    const generatedSignature = crypto
+      .createHmac("sha256", secret)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    if (generatedSignature !== razorpay_signature) {
+      throw new ApiError(400, "INVALID_SIGNATURE", "Payment verification signature mismatch");
+    }
+  }
+
+  const donation = await Donation.findOne({ razorpayOrderId: razorpay_order_id });
+  if (!donation) {
+    throw new ApiError(404, "DONATION_NOT_FOUND", "Donation record not found for this order");
+  }
+
+  let updatedCampaign = null;
+
+  if (donation.status !== "SUCCESS") {
+    donation.status = "SUCCESS";
+    donation.razorpayPaymentId = razorpay_payment_id;
+    donation.razorpaySignature = razorpay_signature || "";
+    donation.receiptNumber = donation.receiptNumber || receipt("DR");
+    donation.paidAt = new Date();
+    await donation.save();
+
+    if (donation.campaign) {
+      updatedCampaign = await DonationCampaign.findByIdAndUpdate(
+        donation.campaign,
+        { $inc: { raisedAmount: donation.amount } },
+        { new: true }
+      );
+    }
+
+    if (donation.donor) {
+      await notifyUser({
+        recipient: donation.donor,
+        title: "Donation Successful",
+        message: `Thank you for your generous contribution of Rs. ${donation.amount}. Your receipt number is ${donation.receiptNumber}.`,
+        metadata: { donation: donation._id, receiptNumber: donation.receiptNumber },
+      });
+    }
+  } else if (donation.campaign) {
+    updatedCampaign = await DonationCampaign.findById(donation.campaign);
+  }
+
+  return res.status(200).json(
+    new ApiResponse("Donation payment verified successfully", {
+      donation,
+      campaign: updatedCampaign,
+    })
+  );
+});
+
 exports.listDonations = asyncHandler(async (req, res) => {
   const filter = {};
   if (req.query.status) filter.status = req.query.status;

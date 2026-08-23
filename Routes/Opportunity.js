@@ -7,6 +7,7 @@ const {
   moderateJob,
   applyToJob,
   listJobApplications,
+  listMyJobApplications,
   updateJobApplicationStatus,
   listScholarships,
   listScholarshipsAdmin,
@@ -29,6 +30,7 @@ router.patch("/jobs/:jobId", auth, updateJob);
 router.patch("/admin/jobs/:jobId/moderate", auth, authorize("job:moderate"), moderateJob);
 router.post("/jobs/:jobId/applications", auth, applyToJob);
 router.get("/jobs/:jobId/applications", auth, listJobApplications);
+router.get("/me/job-applications", auth, listMyJobApplications);
 router.patch("/job-applications/:applicationId/status", auth, updateJobApplicationStatus);
 
 router.get("/scholarships", listScholarships);

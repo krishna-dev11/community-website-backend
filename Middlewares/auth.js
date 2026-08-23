@@ -87,7 +87,7 @@ exports.authorize = (permission) => {
 };
 
 // checked
-// isstudent
+// isStudent
 exports.isStudent = async(req , res , next)=>{
     try{
 
@@ -105,7 +105,6 @@ exports.isStudent = async(req , res , next)=>{
         return res.status(500).json({
             success:false,
             message:"there would be some error in fetching th accountType of user"
-
         })
 
     }
@@ -115,8 +114,6 @@ exports.isStudent = async(req , res , next)=>{
 // isInstructor
 exports.isInstructor = async(req , res , next)=>{
     try{
-
-        // console.log(req.body  , "inst")
 
         if(req.user.accountType !== "Instructor"){
             return res.status(401).json({
@@ -132,7 +129,6 @@ exports.isInstructor = async(req , res , next)=>{
         return res.status(500).json({
             success:false,
             message:"there would be some error in fetching the accountType of user"
-
         })
 
     }
@@ -157,9 +153,38 @@ exports.isAdmin = async(req , res , next)=>{
         return res.status(500).json({
             success:false,
             message:"there would be some error in fetching th accountType of user"
-
         })
 
     }
 }
 
+exports.optionalAuth = async (req, res, next) => {
+    try {
+        const authHeader = req.header("Authorization") || "";
+        const token = req.body?.token || req.cookies?.token || authHeader.replace("Bearer ", "");
+        if (!token) {
+            return next();
+        }
+
+        try {
+            const payload = jwt.verify(token, process.env.JWT_ACCESS_SECRET || process.env.SECRET_KEY);
+            const user = await User.findById(payload.userId || payload.id).select("roles accountType accountStatus active tokenVersion");
+
+            if (user && user.active && !["SUSPENDED", "DEACTIVATED"].includes(user.accountStatus)) {
+                req.user = {
+                    ...payload,
+                    id: String(user._id),
+                    userId: String(user._id),
+                    roles: user.roles,
+                    accountType: user.accountType,
+                    accountStatus: user.accountStatus,
+                };
+            }
+        } catch (ignored) {
+            // Unauthenticated guest request
+        }
+        next();
+    } catch (error) {
+        next();
+    }
+};

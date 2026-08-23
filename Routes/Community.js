@@ -6,6 +6,10 @@ const {
   addIssueResponse,
   listIssueResponses,
   confirmIssueResolution,
+  getDharamshalas,
+  getDharamshalaById,
+  createDharamshala,
+  updateDharamshala,
   createDharamshalaBooking,
   listDharamshalaBookings,
   reviewDharamshalaBooking,
@@ -38,7 +42,7 @@ const {
   getMyMembershipCard,
   verifyMembershipCard,
 } = require("../Controllers/Community");
-const { auth, authorize } = require("../Middlewares/auth");
+const { auth, optionalAuth, authorize } = require("../Middlewares/auth");
 
 const router = express.Router();
 
@@ -49,8 +53,15 @@ router.post("/issues/:issueId/responses", auth, authorize("issue:respond"), addI
 router.patch("/issues/:issueId/status", auth, authorize("issue:moderate"), updateIssueStatus);
 router.patch("/issues/:issueId/confirm-resolution", auth, authorize("issue:respond"), confirmIssueResolution);
 
-router.post("/dharamshala/bookings", auth, authorize("dharamshala:book"), createDharamshalaBooking);
-router.get("/dharamshala/availability", auth, authorize("dharamshala:book"), checkDharamshalaAvailability);
+// Dharamshala Public & Management Routes
+router.get("/dharamshalas", getDharamshalas);
+router.get("/dharamshalas/:id", getDharamshalaById);
+router.post("/dharamshalas", auth, authorize("dharamshala:block"), createDharamshala);
+router.patch("/dharamshalas/:id", auth, authorize("dharamshala:block"), updateDharamshala);
+
+// Booking & Availability (supports both authenticated members and guest non-members)
+router.post("/dharamshala/bookings", optionalAuth, createDharamshalaBooking);
+router.get("/dharamshala/availability", checkDharamshalaAvailability);
 router.get("/dharamshala/bookings", auth, authorize("dharamshala:read"), listDharamshalaBookings);
 router.get("/me/dharamshala/bookings", auth, (req, res, next) => {
   req.query.mine = "true";
