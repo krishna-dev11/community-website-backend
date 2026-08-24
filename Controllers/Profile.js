@@ -120,9 +120,14 @@ exports.updateProfile = asyncHandler(async (req, res) => {
     .populate("additionalDetails")
     .populate("family");
 
-  const sanitized = sanitizeUser(updatedUser);
+  const userObj = updatedUser.toObject();
+  delete userObj.password;
+  delete userObj.token;
 
-  return res.status(200).json(new ApiResponse("Profile updated successfully", sanitized));
+  return res.status(200).json(new ApiResponse("Profile updated successfully", {
+    ...userObj,
+    additionalDetails: updatedUser.additionalDetails,
+  }));
 });
 
 exports.getAllUserDetails = asyncHandler(async (req, res) => {

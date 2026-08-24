@@ -334,7 +334,11 @@ exports.updateIssueStatus = asyncHandler(async (req, res) => {
 });
 
 exports.publishAsCommunitySolution = asyncHandler(async (req, res) => {
-  const { title, summary, solution, category } = req.body;
+  const title = req.body.title || req.body.solutionTitle;
+  const summary = req.body.summary || req.body.solutionSummary;
+  const solution = req.body.solution || req.body.solutionDetails;
+  const category = req.body.category || req.body.solutionCategory;
+
   if (!title || !solution) {
     throw new ApiError(400, "SOLUTION_FIELDS_REQUIRED", "Solution title and details are required");
   }

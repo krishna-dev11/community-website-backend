@@ -113,9 +113,10 @@ async function canViewProtected(viewerProfileId, targetProfileId) {
   if (!viewerProfileId || !targetProfileId) return false;
   if (String(viewerProfileId) === String(targetProfileId)) return true;
   const approved = await MatrimonialContactRequest.exists({
-    requesterProfile: viewerProfileId,
-    targetProfile: targetProfileId,
-    status: "APPROVED",
+    $or: [
+      { requesterProfile: viewerProfileId, targetProfile: targetProfileId, status: "APPROVED" },
+      { requesterProfile: targetProfileId, targetProfile: viewerProfileId, status: "APPROVED" },
+    ],
   });
   return Boolean(approved);
 }
@@ -493,14 +494,30 @@ exports.listMyContactRequests = asyncHandler(async (req, res) => {
     return res.status(200).json(new ApiResponse("Contact requests fetched", { sent: [], received: [] }));
   }
 
-  const [sent, received] = await Promise.all([
+  const [rawSent, rawReceived] = await Promise.all([
     MatrimonialContactRequest.find({ requesterProfile: profile._id })
-      .populate("targetProfile", "displayName photos currentCity profession")
+      .populate("targetProfile", "displayName photos currentCity profession protectedContact guardian")
       .sort({ createdAt: -1 }),
     MatrimonialContactRequest.find({ targetProfile: profile._id })
-      .populate("requesterProfile", "displayName photos currentCity profession")
+      .populate("requesterProfile", "displayName photos currentCity profession protectedContact guardian")
       .sort({ createdAt: -1 }),
   ]);
+
+  const sent = rawSent.map((item) => {
+    const obj = item.toObject ? item.toObject() : { ...item };
+    if (obj.status !== "APPROVED" && obj.targetProfile) {
+      delete obj.targetProfile.protectedContact;
+    }
+    return obj;
+  });
+
+  const received = rawReceived.map((item) => {
+    const obj = item.toObject ? item.toObject() : { ...item };
+    if (obj.status !== "APPROVED" && obj.requesterProfile) {
+      delete obj.requesterProfile.protectedContact;
+    }
+    return obj;
+  });
 
   return res.status(200).json(new ApiResponse("Contact requests fetched", { sent, received }));
 });

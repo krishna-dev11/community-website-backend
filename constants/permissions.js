@@ -42,8 +42,23 @@ const ROLE_PERMISSIONS = {
 };
 
 function hasPermission(roles = [], permission) {
-  const normalizedRoles = Array.isArray(roles) ? roles : [roles];
-  const userPermissions = normalizedRoles.flatMap((role) => ROLE_PERMISSIONS[role] || []);
+  const rawRoles = Array.isArray(roles) ? roles : [roles];
+  const normalizedRoles = rawRoles
+    .filter(Boolean)
+    .map((r) => String(r).toUpperCase().trim());
+
+  if (normalizedRoles.length === 0) {
+    normalizedRoles.push("MEMBER");
+  }
+
+  const userPermissions = normalizedRoles.flatMap((role) => {
+    return (
+      ROLE_PERMISSIONS[role] ||
+      (role === "ADMIN" ? ROLE_PERMISSIONS["SUPER_ADMIN"] : []) ||
+      (role === "MEMBER" ? ROLE_PERMISSIONS["MEMBER"] : []) ||
+      []
+    );
+  });
   const [resource] = permission.split(":");
 
   return (

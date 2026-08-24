@@ -76,9 +76,11 @@ exports.auth = async(req , res , next)=>{
 
 exports.authorize = (permission) => {
     return (req, res, next) => {
-        const roles = req.user?.roles || req.user?.accountType || [];
+        const userRoles = Array.isArray(req.user?.roles) && req.user.roles.length > 0
+            ? req.user.roles
+            : [req.user?.accountType, "MEMBER"].filter(Boolean);
 
-        if (!hasPermission(roles, permission)) {
+        if (!hasPermission(userRoles, permission)) {
             return next(new ApiError(403, "FORBIDDEN", "You do not have permission to perform this action"));
         }
 

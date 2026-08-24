@@ -6,6 +6,7 @@ const { auth } = require("../Middlewares/auth");
 
 
 router.put('/updateProfile' , auth ,  updateProfile)
+router.patch('/updateProfile' , auth ,  updateProfile)
 router.get('/getAllUserDetails' , auth ,  getAllUserDetails)
 router.get('/directory' , auth ,  searchMemberDirectory)
 router.put('/updateDisplayPicture' , auth ,  updateDisplayPicture)
