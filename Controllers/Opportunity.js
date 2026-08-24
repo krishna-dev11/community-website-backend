@@ -251,11 +251,31 @@ exports.applyToJob = asyncHandler(async (req, res) => {
   const resumeUpload = (await uploadFiles(req.files?.resume, process.env.CLOUDINARY_JOB_FOLDER || "samaj/jobs/resumes"))[0];
   const resume = resumeUpload || assetFromBody(req.body.resume);
 
+  const User = require("../Models/user");
+  const applicantUser = await User.findById(req.user.id).populate("additionalDetails");
+  const profileDetails = applicantUser?.additionalDetails || {};
+
+  const applicantSnapshot = {
+    fullName: `${applicantUser?.firstName || ""} ${applicantUser?.lastName || ""}`.trim() || req.body.fullName || "Applicant",
+    email: applicantUser?.email || req.body.email,
+    phone: req.body.phone || profileDetails?.contactNumber,
+    currentCity: req.body.currentCity || profileDetails?.currentCity,
+    education: req.body.education || profileDetails?.education,
+    profession: req.body.profession || profileDetails?.profession,
+    skills: req.body.skills ? (Array.isArray(req.body.skills) ? req.body.skills : String(req.body.skills).split(",").map((s) => s.trim())) : [],
+    experience: req.body.experience || "",
+    expectedSalary: req.body.expectedSalary || "",
+    portfolioUrl: req.body.portfolioUrl || "",
+    linkedInUrl: req.body.linkedInUrl || "",
+    githubUrl: req.body.githubUrl || "",
+  };
+
   const application = await JobApplication.create({
     job: job._id,
     applicant: req.user.id,
     coverLetter: req.body.coverLetter,
     resume,
+    applicantSnapshot,
   });
 
   await notifyUser({

@@ -3,6 +3,8 @@ const {
   createIssue,
   listIssues,
   updateIssueStatus,
+  publishAsCommunitySolution,
+  listPublicSolutions,
   addIssueResponse,
   listIssueResponses,
   confirmIssueResolution,
@@ -51,7 +53,9 @@ router.get("/issues", auth, authorize("issue:read"), listIssues);
 router.get("/issues/:issueId/responses", auth, authorize("issue:read"), listIssueResponses);
 router.post("/issues/:issueId/responses", auth, authorize("issue:respond"), addIssueResponse);
 router.patch("/issues/:issueId/status", auth, authorize("issue:moderate"), updateIssueStatus);
+router.patch("/issues/:issueId/publish-solution", auth, authorize("issue:moderate"), publishAsCommunitySolution);
 router.patch("/issues/:issueId/confirm-resolution", auth, authorize("issue:respond"), confirmIssueResolution);
+router.get("/solutions", listPublicSolutions);
 
 // Dharamshala Public & Management Routes
 router.get("/dharamshalas", getDharamshalas);

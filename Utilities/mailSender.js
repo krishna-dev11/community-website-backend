@@ -1,5 +1,10 @@
 const nodemailer = require("nodemailer");
+const dns = require("node:dns");
 require("dotenv").config();
+
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 exports.mailSender = async (email, title, body) => {
   const host = process.env.EMAIL_HOST || process.env.MAIL_HOST || "smtp.gmail.com";
@@ -14,12 +19,9 @@ exports.mailSender = async (email, title, body) => {
   }
 
   try {
-    console.log(`[mailSender] Sending email to: ${email} | Subject: "${title}" via ${host}:${port} (secure: ${secure})`);
+    console.log(`[mailSender] Sending email to: ${email} | Subject: "${title}" via ${host.includes("gmail") ? "Gmail Service" : `${host}:${port}`} (secure: ${secure})`);
 
-    const transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure,
+    const transportOptions = {
       auth: {
         user,
         pass,
@@ -27,7 +29,18 @@ exports.mailSender = async (email, title, body) => {
       tls: {
         rejectUnauthorized: false,
       },
-    });
+      family: 4,
+    };
+
+    if (host.includes("gmail")) {
+      transportOptions.service = "gmail";
+    } else {
+      transportOptions.host = host;
+      transportOptions.port = port;
+      transportOptions.secure = secure;
+    }
+
+    const transporter = nodemailer.createTransport(transportOptions);
 
     const info = await transporter.sendMail({
       from: process.env.EMAIL_FROM || `"Samaj Community Portal" <${user}>`,

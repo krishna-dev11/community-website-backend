@@ -19,6 +19,7 @@ const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
 const {
   uploadImageToCloudinary,
+  uploadDocumentToCloudinary,
   assetMetadata,
 } = require("../Utilities/uploadImageToCloudinary");
 
@@ -290,12 +291,20 @@ exports.updateIssueStatus = asyncHandler(async (req, res) => {
   const previousStatus = issue.status;
   issue.status = status;
   if (assignedTo !== undefined) issue.assignedTo = assignedTo || undefined;
-  if (status === "REJECTED") issue.moderationReason = reason;
+  if (note || reason) {
+    issue.adminStatusNote = note || reason;
+  }
+  if (status === "REJECTED") {
+    issue.moderationReason = reason || note;
+  }
+  if (status === "RESOLVED") {
+    issue.resolvedAt = new Date();
+  }
   if (status === "ARCHIVED") {
     issue.isArchived = true;
     issue.archivedAt = new Date();
     issue.archivedBy = req.user.id;
-    issue.archiveReason = reason;
+    issue.archiveReason = reason || note;
   }
   await issue.save();
 
@@ -304,7 +313,7 @@ exports.updateIssueStatus = asyncHandler(async (req, res) => {
       issue: issue._id,
       author: req.user.id,
       type: status === "SOLUTION_PROPOSED" ? "PROPOSED_SOLUTION" : "STATUS_NOTE",
-      message: note || `Status changed to ${status}`,
+      message: note || reason || `Status changed to ${status}`,
       previousStatus,
       nextStatus: status,
     });
@@ -317,11 +326,61 @@ exports.updateIssueStatus = asyncHandler(async (req, res) => {
     target: issue._id,
     oldValue: { status: previousStatus },
     newValue: { status },
-    reason,
+    reason: note || reason,
     req,
   });
 
   return res.status(200).json(new ApiResponse("Issue updated successfully", { issue }));
+});
+
+exports.publishAsCommunitySolution = asyncHandler(async (req, res) => {
+  const { title, summary, solution, category } = req.body;
+  if (!title || !solution) {
+    throw new ApiError(400, "SOLUTION_FIELDS_REQUIRED", "Solution title and details are required");
+  }
+
+  const issue = await Issue.findById(req.params.issueId);
+  if (!issue || issue.isArchived) throw new ApiError(404, "ISSUE_NOT_FOUND", "Issue was not found");
+
+  issue.isPublicSolution = true;
+  issue.solutionTitle = title;
+  issue.solutionSummary = summary || issue.description.slice(0, 160);
+  issue.solutionDetails = solution;
+  issue.solutionCategory = category || issue.category || "General";
+  issue.publishedAsSolutionAt = new Date();
+  issue.publishedAsSolutionBy = req.user.id;
+  await issue.save();
+
+  await logAudit({
+    actor: req.user.id,
+    action: "issue.published_as_solution",
+    targetType: "issue",
+    target: issue._id,
+    newValue: { solutionTitle: title },
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Published as public community solution", { issue }));
+});
+
+exports.listPublicSolutions = asyncHandler(async (req, res) => {
+  const filter = { isPublicSolution: true, isArchived: false };
+  if (req.query.category) filter.solutionCategory = String(req.query.category).trim();
+
+  const { items, meta } = await paged(Issue, filter, req.query, { publishedAsSolutionAt: -1, resolvedAt: -1, createdAt: -1 });
+
+  const sanitizedSolutions = items.map((item) => ({
+    _id: item._id,
+    title: item.solutionTitle || item.title,
+    summary: item.solutionSummary || item.description,
+    solution: item.solutionDetails,
+    category: item.solutionCategory || item.category || "General",
+    location: item.location,
+    status: item.status,
+    publishedAt: item.publishedAsSolutionAt || item.resolvedAt || item.updatedAt,
+  }));
+
+  return res.status(200).json(new ApiResponse("Community solutions fetched successfully", { solutions: sanitizedSolutions }, meta));
 });
 
 exports.addIssueResponse = asyncHandler(async (req, res) => {
@@ -689,11 +748,19 @@ exports.createPoll = asyncHandler(async (req, res) => {
     throw new ApiError(400, "POLL_END_DATE_INVALID", "Poll end date must be in the future");
   }
 
+  const isMultipleChoice = Boolean(req.body.isMultipleChoice);
+  const maxSelections = isMultipleChoice ? Math.max(Number(req.body.maxSelections) || 2, 2) : 1;
+
   const poll = await Poll.create({
     title: req.body.title,
     description: req.body.description,
-    options: options.map((label) => ({ label })),
-    startsAt: req.body.startsAt,
+    options: options.map((opt) => typeof opt === "object" ? { label: opt.label } : { label: String(opt).trim() }),
+    isMultipleChoice,
+    maxSelections,
+    allowChangeVote: Boolean(req.body.allowChangeVote),
+    isAnonymous: req.body.isAnonymous !== false,
+    targetAudience: req.body.targetAudience || "ALL",
+    startsAt: req.body.startsAt || new Date(),
     endsAt: req.body.endsAt,
     status: req.body.status === "ACTIVE" ? "ACTIVE" : "DRAFT",
     createdBy: req.user.id,
@@ -703,17 +770,40 @@ exports.createPoll = asyncHandler(async (req, res) => {
 
 exports.listPolls = asyncHandler(async (req, res) => {
   const filter = {};
-  if (req.query.admin === "true" && (req.user.roles || []).some((role) => ["SUPER_ADMIN", "Admin"].includes(role))) {
+  if (req.query.admin === "true" && (req.user?.roles || []).some((role) => ["SUPER_ADMIN", "Admin", "COMMUNITY_ADMIN"].includes(role))) {
     filter.status = { $ne: "ARCHIVED" };
-  } else if (req.query.status) filter.status = req.query.status;
-  else filter.status = { $in: ["ACTIVE", "CLOSED"] };
+  } else if (req.query.status) {
+    filter.status = req.query.status;
+  } else {
+    filter.status = { $in: ["ACTIVE", "CLOSED"] };
+  }
+
   const { items, meta } = await paged(Poll, filter, req.query, { createdAt: -1 });
-  return res.status(200).json(new ApiResponse("Polls fetched successfully", { polls: items }, meta));
+
+  // Attach user vote status if authenticated
+  let userVotesMap = {};
+  if (req.user?.id && items.length > 0) {
+    const pollIds = items.map((p) => p._id);
+    const participations = await VoteParticipation.find({ poll: { $in: pollIds }, member: req.user.id });
+    participations.forEach((p) => {
+      userVotesMap[String(p.poll)] = p.selectedOptions || [];
+    });
+  }
+
+  const enrichedPolls = items.map((poll) => {
+    const pollObj = poll.toObject ? poll.toObject() : { ...poll };
+    const userSelected = userVotesMap[String(poll._id)] || null;
+    pollObj.hasVoted = Boolean(userSelected && userSelected.length > 0);
+    pollObj.userSelectedOptions = userSelected || [];
+    return pollObj;
+  });
+
+  return res.status(200).json(new ApiResponse("Polls fetched successfully", { polls: enrichedPolls }, meta));
 });
 
 exports.updatePollStatus = asyncHandler(async (req, res) => {
-  if (!["ACTIVE", "CLOSED", "ARCHIVED"].includes(req.body.status)) {
-    throw new ApiError(400, "INVALID_POLL_STATUS", "Poll status must be ACTIVE, CLOSED, or ARCHIVED");
+  if (!["DRAFT", "ACTIVE", "CLOSED", "ARCHIVED"].includes(req.body.status)) {
+    throw new ApiError(400, "INVALID_POLL_STATUS", "Poll status must be DRAFT, ACTIVE, CLOSED, or ARCHIVED");
   }
   const poll = await Poll.findByIdAndUpdate(req.params.pollId, { status: req.body.status }, { new: true, runValidators: true });
   if (!poll) throw new ApiError(404, "POLL_NOT_FOUND", "Poll was not found");
@@ -727,6 +817,16 @@ exports.getPollResults = asyncHandler(async (req, res) => {
   });
   if (!poll) throw new ApiError(404, "POLL_NOT_FOUND", "Poll was not found");
 
+  let userSelectedOptions = [];
+  let hasVoted = false;
+  if (req.user?.id) {
+    const participation = await VoteParticipation.findOne({ poll: poll._id, member: req.user.id });
+    if (participation) {
+      hasVoted = true;
+      userSelectedOptions = participation.selectedOptions || [];
+    }
+  }
+
   return res.status(200).json(new ApiResponse("Poll results fetched successfully", {
     poll: {
       _id: poll._id,
@@ -735,6 +835,11 @@ exports.getPollResults = asyncHandler(async (req, res) => {
       status: poll.status,
       endsAt: poll.endsAt,
       totalVotes: poll.totalVotes,
+      voterCount: poll.voterCount || poll.totalVotes,
+      isMultipleChoice: poll.isMultipleChoice,
+      maxSelections: poll.maxSelections,
+      hasVoted,
+      userSelectedOptions,
       options: poll.options.map((option) => ({
         _id: option._id,
         label: option.label,
@@ -746,35 +851,76 @@ exports.getPollResults = asyncHandler(async (req, res) => {
 });
 
 exports.castVote = asyncHandler(async (req, res) => {
-  const { optionId } = req.body;
+  const { optionId, optionIds } = req.body;
+  const targetOptionIds = optionIds || (optionId ? [optionId] : []);
+
+  if (!targetOptionIds.length) {
+    throw new ApiError(400, "OPTION_REQUIRED", "Please select an option to vote");
+  }
+
   const poll = await Poll.findOne({ _id: req.params.pollId, status: "ACTIVE" });
   if (!poll || new Date(poll.endsAt) <= new Date()) {
-    throw new ApiError(409, "POLL_NOT_ACTIVE", "Poll is not active");
+    throw new ApiError(409, "POLL_NOT_ACTIVE", "Poll is not active or has ended");
   }
-  const option = poll.options.id(optionId);
-  if (!option) throw new ApiError(404, "POLL_OPTION_NOT_FOUND", "Poll option was not found");
 
-  const session = await mongoose.startSession();
-  try {
-    await session.withTransaction(async () => {
-      await VoteParticipation.create([{ poll: poll._id, member: req.user.id }], { session });
-      await Vote.create([{ poll: poll._id, option: option._id }], { session });
-      await Poll.updateOne(
-        { _id: poll._id, "options._id": option._id },
-        { $inc: { totalVotes: 1, "options.$.voteCount": 1 } },
-        { session }
-      );
-    });
-  } catch (error) {
-    if (error?.code === 11000) {
-      throw new ApiError(409, "ALREADY_VOTED", "You have already voted in this poll");
+  if (!poll.isMultipleChoice && targetOptionIds.length > 1) {
+    throw new ApiError(400, "SINGLE_SELECTION_ONLY", "This poll only allows selecting one option");
+  }
+
+  if (poll.isMultipleChoice && targetOptionIds.length > (poll.maxSelections || 2)) {
+    throw new ApiError(400, "MAX_SELECTIONS_EXCEEDED", `You can select at most ${poll.maxSelections} options`);
+  }
+
+  // Check valid option IDs
+  const validOptionIds = targetOptionIds.filter((id) => poll.options.id(id));
+  if (validOptionIds.length !== targetOptionIds.length) {
+    throw new ApiError(404, "POLL_OPTION_NOT_FOUND", "One or more selected poll options are invalid");
+  }
+
+  const existingParticipation = await VoteParticipation.findOne({ poll: poll._id, member: req.user.id });
+  if (existingParticipation && !poll.allowChangeVote) {
+    throw new ApiError(409, "ALREADY_VOTED", "You have already cast your vote in this poll");
+  }
+
+  if (existingParticipation && poll.allowChangeVote) {
+    // Decrement previous votes
+    const prevIds = existingParticipation.selectedOptions || [];
+    for (const prevId of prevIds) {
+      await Poll.updateOne({ _id: poll._id, "options._id": prevId }, { $inc: { totalVotes: -1, "options.$.voteCount": -1 } });
     }
-    throw error;
-  } finally {
-    await session.endSession();
+    existingParticipation.selectedOptions = validOptionIds;
+    await existingParticipation.save();
+
+    // Increment new votes
+    for (const newId of validOptionIds) {
+      await Poll.updateOne({ _id: poll._id, "options._id": newId }, { $inc: { totalVotes: 1, "options.$.voteCount": 1 } });
+    }
+  } else {
+    try {
+      await VoteParticipation.create({
+        poll: poll._id,
+        member: req.user.id,
+        selectedOptions: validOptionIds,
+      });
+
+      for (const optId of validOptionIds) {
+        await Vote.create({ poll: poll._id, option: optId });
+        await Poll.updateOne(
+          { _id: poll._id, "options._id": optId },
+          { $inc: { totalVotes: 1, voterCount: 1, "options.$.voteCount": 1 } }
+        );
+      }
+    } catch (error) {
+      if (error?.code === 11000) {
+        throw new ApiError(409, "ALREADY_VOTED", "You have already voted in this poll");
+      }
+      throw error;
+    }
   }
 
-  return res.status(201).json(new ApiResponse("Vote recorded successfully"));
+  return res.status(201).json(new ApiResponse("Vote recorded successfully", {
+    selectedOptions: validOptionIds,
+  }));
 });
 
 exports.createCommunityPost = asyncHandler(async (req, res) => {
@@ -960,22 +1106,43 @@ function createReviewableHandlers(Model, publicName, fields) {
       });
 
       if (publicName === "achievement") {
-        const imageFile = req.files?.image || req.files?.achievementImage || req.files?.photo;
-        if (imageFile) {
-          const uploadResult = await uploadImageToCloudinary(imageFile, "samaj/achievements");
-          payload.image = assetMetadata(uploadResult, imageFile.name);
+        const photoFile = req.files?.recipientPhoto || req.files?.photo || req.files?.image || req.files?.achievementImage;
+        if (photoFile) {
+          const uploadResult = await uploadImageToCloudinary(photoFile, "samaj/achievements/photos");
+          payload.recipientPhoto = assetMetadata(uploadResult, photoFile.name);
+          payload.image = payload.recipientPhoto;
+        } else if (req.body.recipientPhoto) {
+          payload.recipientPhoto = assetFromBody(req.body.recipientPhoto);
+          payload.image = payload.recipientPhoto;
         } else if (req.body.image) {
           payload.image = assetFromBody(req.body.image);
+          payload.recipientPhoto = payload.image;
+        }
+
+        const docFile = req.files?.supportingDocument || req.files?.document || req.files?.certificate;
+        if (docFile) {
+          const uploadResult = await uploadDocumentToCloudinary(docFile, "samaj/achievements/docs");
+          payload.supportingDocument = assetMetadata(uploadResult, docFile.name);
+        } else if (req.body.supportingDocument) {
+          payload.supportingDocument = assetFromBody(req.body.supportingDocument);
         }
       }
 
       if (publicName === "shradhanjali") {
         const photoFile = req.files?.photo || req.files?.tributePhoto || req.files?.image;
         if (photoFile) {
-          const uploadResult = await uploadImageToCloudinary(photoFile, "samaj/shradhanjali");
+          const uploadResult = await uploadImageToCloudinary(photoFile, "samaj/shradhanjali/photos");
           payload.photo = assetMetadata(uploadResult, photoFile.name);
         } else if (req.body.photo) {
           payload.photo = assetFromBody(req.body.photo);
+        }
+
+        const docFile = req.files?.supportingDocument || req.files?.document;
+        if (docFile) {
+          const uploadResult = await uploadDocumentToCloudinary(docFile, "samaj/shradhanjali/docs");
+          payload.supportingDocument = assetMetadata(uploadResult, docFile.name);
+        } else if (req.body.supportingDocument) {
+          payload.supportingDocument = assetFromBody(req.body.supportingDocument);
         }
       }
 
@@ -988,7 +1155,10 @@ function createReviewableHandlers(Model, publicName, fields) {
         throw new ApiError(401, "AUTH_REQUIRED", "Admin review listings require authentication");
       }
       const filter = { status: adminView ? { $ne: "ARCHIVED" } : "PUBLISHED", ...textFilter(req.query.q) };
-      const { items, meta } = await paged(Model, filter, req.query, { createdAt: -1 });
+      const { items, meta } = await paged(Model, filter, req.query, { createdAt: -1 }, {
+        path: "submittedBy",
+        select: "firstName lastName email",
+      });
       return res.status(200).json(new ApiResponse(`${publicName}s fetched successfully`, { [`${publicName}s`]: items }, meta));
     }),
     review: asyncHandler(async (req, res) => {
@@ -1012,6 +1182,8 @@ const achievementHandlers = createReviewableHandlers(Achievement, "achievement",
   "achieverName",
   "achiever",
   "category",
+  "organization",
+  "year",
 ]);
 const shradhanjaliHandlers = createReviewableHandlers(Shradhanjali, "shradhanjali", [
   "personName",
@@ -1019,6 +1191,8 @@ const shradhanjaliHandlers = createReviewableHandlers(Shradhanjali, "shradhanjal
   "dateOfBirth",
   "dateOfPassing",
   "family",
+  "familyInfo",
+  "biography",
 ]);
 
 exports.createAchievement = achievementHandlers.create;

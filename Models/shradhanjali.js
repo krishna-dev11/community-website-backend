@@ -5,8 +5,17 @@ const shradhanjaliSchema = new mongoose.Schema({
   message: { type: String, required: true, trim: true },
   dateOfBirth: Date,
   dateOfPassing: { type: Date, required: true },
+  familyInfo: { type: String, trim: true },
+  biography: { type: String, trim: true },
   family: { type: mongoose.Schema.Types.ObjectId, ref: "Family" },
   photo: {
+    url: String,
+    publicId: String,
+    size: Number,
+    mimeType: String,
+    name: String,
+  },
+  supportingDocument: {
     url: String,
     publicId: String,
     size: Number,

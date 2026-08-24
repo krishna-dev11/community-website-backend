@@ -713,8 +713,10 @@ exports.addGalleryPhotos = asyncHandler(async (req, res) => {
   if (assets.length === 0) {
     throw new ApiError(400, "PHOTOS_REQUIRED", "At least one photo is required");
   }
-  if (assets.length > 50) {
-    throw new ApiError(400, "PHOTO_BATCH_TOO_LARGE", "Upload at most 50 photos at once");
+
+  const currentCount = await GalleryPhoto.countDocuments({ album: album._id, status: { $ne: "ARCHIVED" } });
+  if (currentCount + assets.length > 10) {
+    throw new ApiError(400, "ALBUM_MAX_PHOTOS_EXCEEDED", `An album can hold a maximum of 10 photos. This album currently has ${currentCount} photo(s). You can upload at most ${Math.max(0, 10 - currentCount)} more.`);
   }
 
   const photos = await GalleryPhoto.insertMany(assets.map((asset, index) => ({
@@ -726,7 +728,7 @@ exports.addGalleryPhotos = asyncHandler(async (req, res) => {
     uploadedBy: req.user.id,
   })));
 
-  album.photoCount += photos.length;
+  album.photoCount = await GalleryPhoto.countDocuments({ album: album._id, status: { $ne: "ARCHIVED" } });
   if (!album.coverImage?.url) album.coverImage = photos[0].image;
   await album.save();
 

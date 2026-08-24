@@ -4,6 +4,9 @@ const dns = require("node:dns");
 require("dotenv").config();
 
 dns.setServers(["8.8.8.8", "1.1.1.1"]);
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 
 
@@ -54,7 +57,7 @@ app.use(
 );
 app.use(express.json());
 app.use(cookieParser());
-const allowedOrigins = ( "https://halbahalbisamaj.vercel.app" ||  process.env.CORS_ORIGINS || process.env.FRONTEND_URL  || "http://localhost:5173" )
+const allowedOrigins = ( "http://localhost:5173" || "https://halbahalbisamaj.vercel.app" ||  process.env.CORS_ORIGINS || process.env.FRONTEND_URL   )
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);

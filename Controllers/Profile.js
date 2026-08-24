@@ -83,7 +83,9 @@ function buildProfileUpdate(body) {
   ];
 
   return allowedFields.reduce((payload, field) => {
-    if (body[field] !== undefined) payload[field] = body[field];
+    if (body[field] !== undefined && body[field] !== null) {
+      payload[field] = body[field];
+    }
     return payload;
   }, {});
 }
@@ -101,20 +103,26 @@ exports.updateProfile = asyncHandler(async (req, res) => {
   if (lastName || LastName) existingUser.lastName = lastName || LastName;
   await existingUser.save();
 
-  const updatedProfile = await Profile.findByIdAndUpdate(
-    existingUser.additionalDetails,
-    buildProfileUpdate(req.body),
-    { new: true, runValidators: true }
-  );
+  let updatedProfile;
+  if (existingUser.additionalDetails) {
+    updatedProfile = await Profile.findByIdAndUpdate(
+      existingUser.additionalDetails,
+      buildProfileUpdate(req.body),
+      { new: true, runValidators: true }
+    );
+  } else {
+    updatedProfile = await Profile.create(buildProfileUpdate(req.body));
+    existingUser.additionalDetails = updatedProfile._id;
+    await existingUser.save();
+  }
 
   const updatedUser = await User.findById(userId)
     .populate("additionalDetails")
     .populate("family");
 
-  return res.status(200).json(new ApiResponse("Profile updated successfully", {
-    profile: updatedProfile,
-    data: sanitizeUser(updatedUser),
-  }));
+  const sanitized = sanitizeUser(updatedUser);
+
+  return res.status(200).json(new ApiResponse("Profile updated successfully", sanitized));
 });
 
 exports.getAllUserDetails = asyncHandler(async (req, res) => {

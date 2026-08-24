@@ -13,10 +13,15 @@ const pollSchema = new mongoose.Schema({
     validate: [(options) => options.length >= 2, "At least two poll options are required"],
   },
   status: { type: String, enum: ["DRAFT", "ACTIVE", "CLOSED", "ARCHIVED"], default: "DRAFT", index: true },
+  isMultipleChoice: { type: Boolean, default: false },
+  maxSelections: { type: Number, default: 1 },
+  allowChangeVote: { type: Boolean, default: false },
+  targetAudience: { type: String, default: "ALL" },
   startsAt: Date,
   endsAt: { type: Date, required: true, index: true },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "user", required: true },
   totalVotes: { type: Number, default: 0 },
+  voterCount: { type: Number, default: 0 },
   isAnonymous: { type: Boolean, default: true },
 }, { timestamps: true });
 

@@ -27,7 +27,16 @@ const issueSchema = new mongoose.Schema({
   submittedBy: { type: mongoose.Schema.Types.ObjectId, ref: "user", required: true, index: true },
   assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: "user" },
   moderationReason: String,
+  adminStatusNote: { type: String, trim: true },
   reopenCount: { type: Number, default: 0 },
+  isPublicSolution: { type: Boolean, default: false, index: true },
+  solutionTitle: { type: String, trim: true },
+  solutionSummary: { type: String, trim: true },
+  solutionDetails: { type: String, trim: true },
+  solutionCategory: { type: String, trim: true },
+  resolvedAt: Date,
+  publishedAsSolutionAt: Date,
+  publishedAsSolutionBy: { type: mongoose.Schema.Types.ObjectId, ref: "user" },
   isArchived: { type: Boolean, default: false, index: true },
   archivedAt: Date,
   archivedBy: { type: mongoose.Schema.Types.ObjectId, ref: "user" },
@@ -36,5 +45,6 @@ const issueSchema = new mongoose.Schema({
 
 issueSchema.index({ title: "text", description: "text", category: "text", location: "text" });
 issueSchema.index({ status: 1, createdAt: -1 });
+issueSchema.index({ isPublicSolution: 1, resolvedAt: -1 });
 
 module.exports = mongoose.model("Issue", issueSchema);

@@ -351,8 +351,22 @@ exports.expressInterest = asyncHandler(async (req, res) => {
     throw new ApiError(400, "SELF_INTEREST_NOT_ALLOWED", "You cannot express interest in your own profile");
   }
 
-  const blocked = await MatrimonialBlock.exists({ blocker: req.user.id, blockedProfile: toProfile._id });
-  if (blocked) throw new ApiError(409, "MATRIMONIAL_PROFILE_BLOCKED", "You have blocked this profile");
+  const priorRejected = await MatrimonialInterest.exists({
+    fromProfile: fromProfile._id,
+    toProfile: toProfile._id,
+    status: "REJECTED",
+  });
+  if (priorRejected) {
+    throw new ApiError(409, "INTEREST_PREVIOUSLY_REJECTED", "This member has previously declined interest. Repeated requests are not permitted.");
+  }
+
+  const blocked = await MatrimonialBlock.exists({
+    $or: [
+      { blocker: req.user.id, blockedProfile: toProfile._id },
+      { blocker: toProfile.owner, blockedProfile: fromProfile._id },
+    ],
+  });
+  if (blocked) throw new ApiError(409, "MATRIMONIAL_PROFILE_BLOCKED", "Communication with this matrimonial profile is blocked");
 
   let interest;
   try {
