@@ -24,7 +24,7 @@ const matrimonialRoutes = require("./Routes/Matrimonial")
 const { razorpayWebhook } = require("./Controllers/Payment")
 // const aiRoutes = require("./Routes/aiRoutes");
 
-
+console.log("Mongo URI exists:", !!process.env.MONGODB_URI);
 
 const {dbconnect} = require('./config/Database')
 const requestContext = require("./Middlewares/requestContext")
@@ -57,7 +57,7 @@ app.use(
 );
 app.use(express.json());
 app.use(cookieParser());
-const allowedOrigins = (  "https://halbahalbisamaj.vercel.app" ||  process.env.CORS_ORIGINS || process.env.FRONTEND_URL  || "http://localhost:5173"   )
+const allowedOrigins = ( "https://halbahalbisamaj.vercel.app" ||  process.env.CORS_ORIGINS || process.env.FRONTEND_URL || "http://localhost:5173"  )
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
