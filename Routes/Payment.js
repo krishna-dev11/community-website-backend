@@ -2,6 +2,7 @@ const express = require("express");
 const {
   listDonationCampaigns,
   listDonationCampaignsAdmin,
+  listPublicSupporters,
   createDonationCampaign,
   updateDonationCampaign,
   archiveDonationCampaign,
@@ -23,6 +24,7 @@ const router = express.Router();
 router.post("/webhooks/razorpay", razorpayWebhook);
 
 router.get("/donation-campaigns", listDonationCampaigns);
+router.get("/donations/supporters", listPublicSupporters);
 router.get("/admin/donation-campaigns", auth, authorize("donation:read"), listDonationCampaignsAdmin);
 router.post("/donation-campaigns", auth, authorize("donation:create"), createDonationCampaign);
 router.patch("/donation-campaigns/:campaignId", auth, authorize("donation:update"), updateDonationCampaign);

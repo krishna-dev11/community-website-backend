@@ -32,10 +32,11 @@ const dharamshalaBookingSchema = new mongoose.Schema({
   specialRequests: { type: String, trim: true },
   reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "user" },
   reviewedAt: Date,
-  reviewMessage: String,
+  reviewMessage: { type: String, trim: true },
+  reviewNote: { type: String, trim: true },
   cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: "user" },
   cancelledAt: Date,
-  cancellationReason: String,
+  cancellationReason: { type: String, trim: true },
 }, { timestamps: true });
 
 dharamshalaBookingSchema.index({ dharamshala: 1, status: 1, startDate: 1, endDate: 1 });

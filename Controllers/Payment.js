@@ -122,6 +122,57 @@ exports.listDonationCampaignsAdmin = asyncHandler(async (req, res) => {
   return res.status(200).json(new ApiResponse("Admin donation campaigns fetched successfully", { campaigns: items }, meta));
 });
 
+exports.listPublicSupporters = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = pageOptions(req.query);
+  const filter = { status: "SUCCESS" };
+  if (req.query.campaign) filter.campaign = req.query.campaign;
+
+  const [donations, total, activeCampaign] = await Promise.all([
+    Donation.find(filter)
+      .populate("campaign", "title status raisedAmount goalAmount")
+      .populate("donor", "firstName lastName imageUrl")
+      .sort({ paidAt: -1, createdAt: -1 })
+      .skip(skip)
+      .limit(limit),
+    Donation.countDocuments(filter),
+    DonationCampaign.findOne({
+      status: "ACTIVE",
+      $or: [
+        { endDate: { $exists: false } },
+        { endDate: null },
+        { endDate: { $gt: new Date() } },
+      ],
+    }).sort({ createdAt: -1 }),
+  ]);
+
+  const supporters = donations.map((donation) => {
+    const publicName = donation.anonymous
+      ? "Anonymous Supporter"
+      : donation.donorName || [donation.donor?.firstName, donation.donor?.lastName].filter(Boolean).join(" ") || "Community Supporter";
+
+    return {
+      _id: donation._id,
+      donorName: publicName,
+      donorPhoto: donation.anonymous ? null : donation.donor?.imageUrl || null,
+      amount: donation.anonymous ? null : donation.amount,
+      campaignTitle: donation.campaign?.title || "General Donation",
+      note: donation.anonymous ? "" : donation.note,
+      donatedAt: donation.paidAt || donation.createdAt,
+      anonymous: donation.anonymous,
+    };
+  });
+
+  return res.status(200).json(new ApiResponse("Public supporters fetched successfully", {
+    supporters,
+    campaign: activeCampaign,
+  }, {
+    page,
+    limit,
+    total,
+    pages: Math.ceil(total / limit),
+  }));
+});
+
 const { uploadImageToCloudinary, assetMetadata } = require("../Utilities/uploadImageToCloudinary");
 
 function assetFromBody(asset) {

@@ -81,7 +81,7 @@ router.patch("/dharamshala/blocked-dates/:blockId/archive", auth, authorize("dha
 router.post("/polls", auth, authorize("poll:create"), createPoll);
 router.get("/polls", auth, authorize("poll:read"), listPolls);
 router.patch("/polls/:pollId/status", auth, authorize("poll:update"), updatePollStatus);
-router.get("/polls/:pollId/results", auth, authorize("poll:read"), getPollResults);
+router.get("/polls/:pollId/results", auth, authorize("poll:update"), getPollResults);
 router.post("/polls/:pollId/votes", auth, authorize("poll:vote"), castVote);
 
 router.post("/posts", auth, authorize("community:create"), createCommunityPost);
@@ -100,12 +100,20 @@ router.get("/admin/achievements", auth, authorize("achievement:review"), (req, r
   req.query.admin = "true";
   next();
 }, listAchievements);
+router.get("/me/achievements", auth, authorize("achievement:create"), (req, res, next) => {
+  req.query.mine = "true";
+  next();
+}, listAchievements);
 router.get("/achievements", listAchievements);
 router.patch("/achievements/:achievementId/review", auth, authorize("achievement:review"), reviewAchievement);
 
 router.post("/shradhanjalis", auth, authorize("shradhanjali:create"), createShradhanjali);
 router.get("/admin/shradhanjalis", auth, authorize("shradhanjali:review"), (req, res, next) => {
   req.query.admin = "true";
+  next();
+}, listShradhanjalis);
+router.get("/me/shradhanjalis", auth, authorize("shradhanjali:create"), (req, res, next) => {
+  req.query.mine = "true";
   next();
 }, listShradhanjalis);
 router.get("/shradhanjalis", listShradhanjalis);

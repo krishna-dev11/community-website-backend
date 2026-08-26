@@ -33,6 +33,17 @@ function assetFromBody(asset) {
   };
 }
 
+function ageFromDate(value) {
+  if (!value) return null;
+  const birth = new Date(value);
+  if (Number.isNaN(birth.getTime())) return null;
+  const today = new Date();
+  let age = today.getFullYear() - birth.getFullYear();
+  const monthDiff = today.getMonth() - birth.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) age -= 1;
+  return age >= 0 ? age : null;
+}
+
 function profilePayload(body) {
   const payload = {};
   [
@@ -89,7 +100,9 @@ function profilePayload(body) {
 function sanitizeProfile(profile, includeProtected = false) {
   if (!profile) return profile;
   const output = profile.toObject ? profile.toObject() : { ...profile };
+  output.age = ageFromDate(output.dateOfBirth);
   if (!includeProtected) {
+    delete output.dateOfBirth;
     delete output.protectedContact;
     if (output.guardian) {
       output.guardian = {

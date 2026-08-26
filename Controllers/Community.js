@@ -556,6 +556,23 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
   const guestEmail = isMember ? requesterUser.email : (req.body.guestEmail || "");
   const guestPhone = req.body.guestPhone || (isMember ? requesterUser.contactNumber : "");
 
+  const duplicateFilter = {
+    dharamshala: dharamshala?._id,
+    roomType: req.body.roomType,
+    startDate: start,
+    endDate: end,
+    status: "PENDING",
+  };
+  if (req.user?.id) duplicateFilter.requester = req.user.id;
+  else if (guestPhone) duplicateFilter.guestPhone = guestPhone;
+
+  if (req.user?.id || guestPhone) {
+    const duplicateBooking = await DharamshalaBooking.findOne(duplicateFilter).select("_id status");
+    if (duplicateBooking) {
+      throw new ApiError(409, "DHARAMSHALA_BOOKING_ALREADY_PENDING", "A pending booking request already exists for these dates and room type");
+    }
+  }
+
   const booking = await DharamshalaBooking.create({
     dharamshala: dharamshala?._id,
     dharamshalaName: dharamshala?.name || "Samaj Dharamshala",
@@ -593,9 +610,18 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
 
 exports.listDharamshalaBookings = asyncHandler(async (req, res) => {
   const filter = {};
-  if (req.query.mine === "true" && req.user?.id) {
+  const isDharamshalaAdmin = (req.user?.roles || []).some((role) =>
+    ["DHARAMSHALA_ADMIN", "SUPER_ADMIN", "Admin"].includes(role)
+  );
+
+  // Non-admins or "mine=true" queries are strictly restricted to their own bookings
+  if (req.query.mine === "true" || !isDharamshalaAdmin) {
+    if (!req.user?.id) {
+      throw new ApiError(401, "AUTH_REQUIRED", "Authentication required to view bookings");
+    }
     filter.requester = req.user.id;
   }
+
   if (req.query.status) filter.status = req.query.status;
   if (req.query.dharamshalaId) filter.dharamshala = req.query.dharamshalaId;
 
@@ -607,7 +633,9 @@ exports.listDharamshalaBookings = asyncHandler(async (req, res) => {
 });
 
 exports.reviewDharamshalaBooking = asyncHandler(async (req, res) => {
-  const { action, reviewMessage } = req.body;
+  const { action } = req.body;
+  const note = (req.body.reviewNote || req.body.reviewMessage || req.body.reason || "").trim();
+
   if (!["APPROVE", "REJECT"].includes(action)) {
     throw new ApiError(400, "INVALID_BOOKING_REVIEW_ACTION", "Action must be APPROVE or REJECT");
   }
@@ -626,7 +654,8 @@ exports.reviewDharamshalaBooking = asyncHandler(async (req, res) => {
   booking.status = action === "APPROVE" ? "APPROVED" : "REJECTED";
   booking.reviewedBy = req.user.id;
   booking.reviewedAt = new Date();
-  booking.reviewMessage = reviewMessage;
+  booking.reviewMessage = note || (action === "APPROVE" ? "Booking approved by administrator" : "");
+  booking.reviewNote = note || (action === "APPROVE" ? "Booking approved by administrator" : "");
   await booking.save();
 
   await logAudit({
@@ -636,7 +665,7 @@ exports.reviewDharamshalaBooking = asyncHandler(async (req, res) => {
     target: booking._id,
     oldValue: { status: previousStatus },
     newValue: { status: booking.status },
-    reason: reviewMessage,
+    reason: note || undefined,
     req,
   });
 
@@ -652,10 +681,11 @@ exports.cancelDharamshalaBooking = asyncHandler(async (req, res) => {
     throw new ApiError(403, "BOOKING_CANCEL_FORBIDDEN", "You cannot cancel this booking");
   }
 
+  const reason = (req.body.reason || req.body.cancellationReason || req.body.reviewMessage || "Cancelled by user").trim();
   booking.status = "CANCELLED";
   booking.cancelledBy = req.user.id;
   booking.cancelledAt = new Date();
-  booking.cancellationReason = req.body.reason;
+  booking.cancellationReason = reason;
   await booking.save();
   return res.status(200).json(new ApiResponse("Booking cancelled successfully", { booking }));
 });
@@ -817,19 +847,14 @@ exports.updatePollStatus = asyncHandler(async (req, res) => {
 exports.getPollResults = asyncHandler(async (req, res) => {
   const poll = await Poll.findOne({
     _id: req.params.pollId,
-    status: { $in: ["ACTIVE", "CLOSED"] },
+    status: { $ne: "ARCHIVED" },
   });
   if (!poll) throw new ApiError(404, "POLL_NOT_FOUND", "Poll was not found");
 
-  let userSelectedOptions = [];
-  let hasVoted = false;
-  if (req.user?.id) {
-    const participation = await VoteParticipation.findOne({ poll: poll._id, member: req.user.id });
-    if (participation) {
-      hasVoted = true;
-      userSelectedOptions = participation.selectedOptions || [];
-    }
-  }
+  const optionLabelById = new Map(poll.options.map((option) => [String(option._id), option.label]));
+  const voters = await VoteParticipation.find({ poll: poll._id })
+    .populate("member", "firstName lastName imageUrl")
+    .sort({ updatedAt: -1, createdAt: -1 });
 
   return res.status(200).json(new ApiResponse("Poll results fetched successfully", {
     poll: {
@@ -839,16 +864,30 @@ exports.getPollResults = asyncHandler(async (req, res) => {
       status: poll.status,
       endsAt: poll.endsAt,
       totalVotes: poll.totalVotes,
-      voterCount: poll.voterCount || poll.totalVotes,
+      voterCount: voters.length,
+      uniqueVoters: voters.length,
       isMultipleChoice: poll.isMultipleChoice,
       maxSelections: poll.maxSelections,
-      hasVoted,
-      userSelectedOptions,
+      allowChangeVote: poll.allowChangeVote,
       options: poll.options.map((option) => ({
         _id: option._id,
         label: option.label,
         voteCount: option.voteCount,
         percentage: poll.totalVotes > 0 ? Math.round((option.voteCount / poll.totalVotes) * 10000) / 100 : 0,
+      })),
+      voters: voters.map((participation) => ({
+        memberId: participation.member?._id,
+        name: [participation.member?.firstName, participation.member?.lastName].filter(Boolean).join(" ") || "Member",
+        photo: participation.member?.imageUrl,
+        selectedOptions: (participation.selectedOptions || []).map((optionId) => ({
+          optionId,
+          label: optionLabelById.get(String(optionId)) || "Unknown option",
+        })),
+        votedAt: participation.createdAt,
+        updatedAt: participation.updatedAt,
+        voteChanged: participation.updatedAt && participation.createdAt
+          ? participation.updatedAt.getTime() !== participation.createdAt.getTime()
+          : false,
       })),
     },
   }));
@@ -1150,18 +1189,41 @@ function createReviewableHandlers(Model, publicName, fields) {
         }
       }
 
+      const duplicateFilter = { submittedBy: req.user.id, status: "PENDING" };
+      if (publicName === "achievement") {
+        duplicateFilter.title = new RegExp(`^${String(payload.title || "").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+        const duplicate = await Model.findOne(duplicateFilter);
+        if (duplicate) {
+          throw new ApiError(409, "ACHIEVEMENT_ALREADY_PENDING", "You already have an achievement submission pending committee review.");
+        }
+      }
+      if (publicName === "shradhanjali") {
+        duplicateFilter.personName = new RegExp(`^${String(payload.personName || "").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+        if (payload.dateOfPassing) duplicateFilter.dateOfPassing = new Date(payload.dateOfPassing);
+        const duplicate = await Model.findOne(duplicateFilter);
+        if (duplicate) {
+          throw new ApiError(409, "SHRADHANJALI_ALREADY_PENDING", "A tribute for this person is already under verification.");
+        }
+      }
+
       const item = await Model.create({ ...payload, submittedBy: req.user.id });
       return res.status(201).json(new ApiResponse(`${publicName} submitted successfully`, { [publicName]: item }));
     }),
     list: asyncHandler(async (req, res) => {
       const adminView = req.query.admin === "true";
+      const mineView = req.query.mine === "true";
       if (adminView && !req.user?.id) {
         throw new ApiError(401, "AUTH_REQUIRED", "Admin review listings require authentication");
       }
-      const filter = { status: adminView ? { $ne: "ARCHIVED" } : "PUBLISHED", ...textFilter(req.query.q) };
+      if (mineView && !req.user?.id) {
+        throw new ApiError(401, "AUTH_REQUIRED", "Own submissions require authentication");
+      }
+      const filter = mineView
+        ? { submittedBy: req.user.id, status: { $ne: "ARCHIVED" }, ...textFilter(req.query.q) }
+        : { status: adminView ? { $ne: "ARCHIVED" } : "PUBLISHED", ...textFilter(req.query.q) };
       const { items, meta } = await paged(Model, filter, req.query, { createdAt: -1 }, {
         path: "submittedBy",
-        select: "firstName lastName email",
+        select: adminView ? "firstName lastName email" : "firstName lastName imageUrl",
       });
       return res.status(200).json(new ApiResponse(`${publicName}s fetched successfully`, { [`${publicName}s`]: items }, meta));
     }),
