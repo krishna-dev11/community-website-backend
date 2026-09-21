@@ -5,11 +5,20 @@ const CMSContent = require("../Models/cmsContent");
 const Gotra = require("../Models/gotra");
 const GalleryAlbum = require("../Models/galleryAlbum");
 const GalleryPhoto = require("../Models/galleryPhoto");
+const YouTubeVideo = require("../Models/youtubeVideo");
 const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
 const { uploadImageToCloudinary, uploadPublicationPdf } = require("../Utilities/uploadImageToCloudinary");
+
+function extractYouTubeVideoId(url) {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  const regExp = /(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
+  const match = trimmed.match(regExp);
+  return match ? match[1] : null;
+}
 
 function pageOptions(query) {
   const page = Math.max(Number(query.page) || 1, 1);
@@ -75,6 +84,36 @@ function assetFromBody(asset) {
   };
 }
 
+function publicationFileName(title) {
+  const safeTitle = String(title || "Samaj_Patrika")
+    .normalize("NFKD")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+  return `${safeTitle || "Samaj_Patrika"}.pdf`;
+}
+
+async function getPublicationPdf(publicationId) {
+  const publication = await Publication.findById(publicationId).select("title file status");
+  if (!publication || publication.status === "ARCHIVED") {
+    throw new ApiError(404, "PUBLICATION_NOT_FOUND", "Publication was not found or has been archived");
+  }
+  if (!publication?.file?.url) {
+    throw new ApiError(404, "PUBLICATION_FILE_NOT_FOUND", "Publication file was not found");
+  }
+
+  const upstream = await fetch(publication.file.url);
+  if (!upstream.ok) {
+    throw new ApiError(502, "PUBLICATION_FILE_FETCH_FAILED", "Could not fetch publication file from storage");
+  }
+
+  const buffer = Buffer.from(await upstream.arrayBuffer());
+  if (buffer.length < 5 || buffer.subarray(0, 5).toString() !== "%PDF-") {
+    throw new ApiError(502, "PUBLICATION_FILE_INVALID", "Publication file is not a valid PDF");
+  }
+  return { publication, buffer, fileName: publicationFileName(publication.title) };
+}
+
 function asArray(value) {
   if (!value) return [];
   return Array.isArray(value) ? value : [value];
@@ -99,7 +138,10 @@ async function uploadPublicationFiles(files, folder) {
     if (!result?.secure_url) {
       throw new ApiError(500, "FILE_UPLOAD_FAILED", "Could not upload publication file");
     }
-    uploaded.push(assetFromCloudinary(result, file.originalname || file.name));
+    uploaded.push({
+      ...assetFromCloudinary(result, file.originalname || file.name),
+      mimeType: file.mimetype || file.type || result.format || result.resource_type,
+    });
   }
   return uploaded;
 }
@@ -412,6 +454,28 @@ exports.trackPublicationDownload = asyncHandler(async (req, res) => {
 
   if (!publication) throw new ApiError(404, "PUBLICATION_NOT_FOUND", "Publication was not found");
   return res.status(200).json(new ApiResponse("Download tracked successfully", { publication }));
+});
+
+exports.viewPublication = asyncHandler(async (req, res) => {
+  const { publication, buffer, fileName } = await getPublicationPdf(req.params.publicationId);
+  const rawTitle = (publication?.title || "Samaj_Patrika").trim().replace(/[\r\n\t"]/g, "_");
+  const encodedFileName = encodeURIComponent(`${rawTitle}.pdf`);
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `inline; filename="${fileName}"; filename*=UTF-8''${encodedFileName}`);
+  res.setHeader("Content-Length", buffer.length);
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  return res.status(200).send(buffer);
+});
+
+exports.downloadPublication = asyncHandler(async (req, res) => {
+  const { publication, buffer, fileName } = await getPublicationPdf(req.params.publicationId);
+  await Publication.findByIdAndUpdate(req.params.publicationId, { $inc: { downloadCount: 1 } }).catch(() => {});
+  const rawTitle = (publication?.title || "Samaj_Patrika").trim().replace(/[\r\n\t"]/g, "_");
+  const encodedFileName = encodeURIComponent(`${rawTitle}.pdf`);
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"; filename*=UTF-8''${encodedFileName}`);
+  res.setHeader("Content-Length", buffer.length);
+  return res.status(200).send(buffer);
 });
 
 exports.listManagementMembers = asyncHandler(async (req, res) => {
@@ -772,3 +836,173 @@ exports.archiveGalleryPhoto = asyncHandler(async (req, res) => {
 
   return res.status(200).json(new ApiResponse("Gallery photo archived successfully", { photo }));
 });
+
+// ==========================================
+// YOUTUBE VIDEO MANAGEMENT (Additive Feature)
+// ==========================================
+
+exports.listVideos = asyncHandler(async (req, res) => {
+  const filter = {
+    status: "PUBLISHED",
+    ...textFilter(req.query.q),
+  };
+  const { items, meta } = await paged(
+    YouTubeVideo,
+    filter,
+    req.query,
+    { displayOrder: 1, createdAt: -1 }
+  );
+  return res.status(200).json(new ApiResponse("Videos fetched successfully", { videos: items }, meta));
+});
+
+exports.listVideosAdmin = asyncHandler(async (req, res) => {
+  const filter = {
+    ...(req.query.status ? { status: req.query.status } : { status: { $ne: "ARCHIVED" } }),
+    ...textFilter(req.query.q),
+  };
+  const { items, meta } = await paged(
+    YouTubeVideo,
+    filter,
+    req.query,
+    { displayOrder: 1, createdAt: -1 }
+  );
+  return res.status(200).json(new ApiResponse("Admin videos fetched successfully", { videos: items }, meta));
+});
+
+exports.createVideo = asyncHandler(async (req, res) => {
+  const { title, youtubeUrl, description, eventName, eventDate, displayOrder, status } = req.body;
+  if (!title || !title.trim()) {
+    throw new ApiError(400, "TITLE_REQUIRED", "Video title is required");
+  }
+  if (!youtubeUrl || !youtubeUrl.trim()) {
+    throw new ApiError(400, "URL_REQUIRED", "YouTube URL is required");
+  }
+
+  const videoId = extractYouTubeVideoId(youtubeUrl);
+  if (!videoId) {
+    throw new ApiError(400, "INVALID_YOUTUBE_URL", "Please provide a valid YouTube video URL");
+  }
+
+  const embedUrl = `https://www.youtube-nocookie.com/embed/${videoId}`;
+  const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+
+  const video = await YouTubeVideo.create({
+    title: title.trim(),
+    youtubeUrl: youtubeUrl.trim(),
+    videoId,
+    embedUrl,
+    thumbnailUrl,
+    description: description ? description.trim() : "",
+    eventName: eventName ? eventName.trim() : "",
+    eventDate: eventDate ? new Date(eventDate) : undefined,
+    displayOrder: Number(displayOrder || 0),
+    status: status === "PUBLISHED" ? "PUBLISHED" : "DRAFT",
+    createdBy: req.user.id,
+  });
+
+  await logAudit({
+    actor: req.user.id,
+    action: "content.video.created",
+    targetType: "youtubeVideo",
+    target: video._id,
+    newValue: { title: video.title, videoId: video.videoId, status: video.status },
+    req,
+  });
+
+  return res.status(201).json(new ApiResponse("YouTube video added successfully", { video }));
+});
+
+exports.updateVideo = asyncHandler(async (req, res) => {
+  const video = await YouTubeVideo.findById(req.params.videoId);
+  if (!video) throw new ApiError(404, "VIDEO_NOT_FOUND", "YouTube video was not found");
+
+  const updates = {};
+  if (req.body.title !== undefined) updates.title = req.body.title.trim();
+  if (req.body.description !== undefined) updates.description = req.body.description.trim();
+  if (req.body.eventName !== undefined) updates.eventName = req.body.eventName.trim();
+  if (req.body.eventDate !== undefined) updates.eventDate = req.body.eventDate ? new Date(req.body.eventDate) : null;
+  if (req.body.displayOrder !== undefined) updates.displayOrder = Number(req.body.displayOrder || 0);
+  if (req.body.status !== undefined && ["DRAFT", "PUBLISHED", "ARCHIVED"].includes(req.body.status)) {
+    updates.status = req.body.status;
+  }
+
+  if (req.body.youtubeUrl && req.body.youtubeUrl.trim() !== video.youtubeUrl) {
+    const videoId = extractYouTubeVideoId(req.body.youtubeUrl);
+    if (!videoId) {
+      throw new ApiError(400, "INVALID_YOUTUBE_URL", "Please provide a valid YouTube video URL");
+    }
+    updates.youtubeUrl = req.body.youtubeUrl.trim();
+    updates.videoId = videoId;
+    updates.embedUrl = `https://www.youtube-nocookie.com/embed/${videoId}`;
+    updates.thumbnailUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+  }
+
+  updates.updatedBy = req.user.id;
+  const updatedVideo = await YouTubeVideo.findByIdAndUpdate(video._id, updates, { new: true });
+
+  await logAudit({
+    actor: req.user.id,
+    action: "content.video.updated",
+    targetType: "youtubeVideo",
+    target: video._id,
+    newValue: updates,
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("YouTube video updated successfully", { video: updatedVideo }));
+});
+
+exports.publishVideo = asyncHandler(async (req, res) => {
+  const video = await YouTubeVideo.findByIdAndUpdate(
+    req.params.videoId,
+    { status: "PUBLISHED", updatedBy: req.user.id },
+    { new: true }
+  );
+  if (!video) throw new ApiError(404, "VIDEO_NOT_FOUND", "YouTube video was not found");
+
+  await logAudit({
+    actor: req.user.id,
+    action: "content.video.published",
+    targetType: "youtubeVideo",
+    target: video._id,
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Video published successfully", { video }));
+});
+
+exports.unpublishVideo = asyncHandler(async (req, res) => {
+  const video = await YouTubeVideo.findByIdAndUpdate(
+    req.params.videoId,
+    { status: "DRAFT", updatedBy: req.user.id },
+    { new: true }
+  );
+  if (!video) throw new ApiError(404, "VIDEO_NOT_FOUND", "YouTube video was not found");
+
+  await logAudit({
+    actor: req.user.id,
+    action: "content.video.unpublished",
+    targetType: "youtubeVideo",
+    target: video._id,
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Video unpublished successfully", { video }));
+});
+
+exports.deleteVideo = asyncHandler(async (req, res) => {
+  const video = await YouTubeVideo.findByIdAndDelete(req.params.videoId);
+  if (!video) throw new ApiError(404, "VIDEO_NOT_FOUND", "YouTube video was not found");
+
+  await logAudit({
+    actor: req.user.id,
+    action: "content.video.deleted",
+    targetType: "youtubeVideo",
+    target: video._id,
+    oldValue: { title: video.title, videoId: video.videoId },
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Video deleted successfully", { videoId: req.params.videoId }));
+});
+

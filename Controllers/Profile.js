@@ -21,6 +21,13 @@ function isMemberViewer(viewer) {
   return viewer && viewer.accountStatus === "ACTIVE";
 }
 
+function isAuthorizedAdmin(viewer) {
+  if (!viewer) return false;
+  if (viewer.accountType === "Admin") return true;
+  const roles = (viewer.roles || []).map((r) => String(r).toUpperCase());
+  return roles.includes("SUPER_ADMIN") || roles.includes("ADMIN") || roles.includes("COMMUNITY_ADMIN") || roles.includes("MODERATOR");
+}
+
 function canSeeField(visibility, viewer) {
   if (visibility === "PUBLIC") return true;
   if (visibility === "MEMBERS_ONLY") return isMemberViewer(viewer);
@@ -151,6 +158,7 @@ exports.getAllUserDetails = asyncHandler(async (req, res) => {
 });
 
 exports.searchMemberDirectory = asyncHandler(async (req, res) => {
+  const isAdmin = isAuthorizedAdmin(req.user);
   const page = Math.max(Number(req.query.page) || 1, 1);
   const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
   const skip = (page - 1) * limit;
@@ -161,11 +169,14 @@ exports.searchMemberDirectory = asyncHandler(async (req, res) => {
   const profileFilter = {};
   const nameQuery = req.query.q ? String(req.query.q).trim() : null;
 
-  if (req.query.family) userFilter.family = req.query.family;
-  if (req.query.city) profileFilter.currentCity = new RegExp(String(req.query.city).trim(), "i");
-  if (req.query.profession) profileFilter.profession = new RegExp(String(req.query.profession).trim(), "i");
-  if (req.query.education) profileFilter.education = new RegExp(String(req.query.education).trim(), "i");
-  if (req.query.nativePlace) profileFilter.nativePlace = new RegExp(String(req.query.nativePlace).trim(), "i");
+  // Strict Privacy: Only admins are allowed to filter by private attributes (city, profession, education, nativePlace, family)
+  if (isAdmin) {
+    if (req.query.family) userFilter.family = req.query.family;
+    if (req.query.city) profileFilter.currentCity = new RegExp(String(req.query.city).trim(), "i");
+    if (req.query.profession) profileFilter.profession = new RegExp(String(req.query.profession).trim(), "i");
+    if (req.query.education) profileFilter.education = new RegExp(String(req.query.education).trim(), "i");
+    if (req.query.nativePlace) profileFilter.nativePlace = new RegExp(String(req.query.nativePlace).trim(), "i");
+  }
 
   const baseProfileIds = Object.keys(profileFilter).length > 0
     ? (await Profile.find(profileFilter).select("_id")).map((profile) => profile._id)
@@ -187,43 +198,71 @@ exports.searchMemberDirectory = asyncHandler(async (req, res) => {
   }
 
   if (nameQuery) {
-    const profileSearchFilter = {
-      ...(baseProfileIds ? { _id: { $in: baseProfileIds } } : {}),
-      $or: [
-        { profession: new RegExp(nameQuery, "i") },
-        { currentCity: new RegExp(nameQuery, "i") },
-        { education: new RegExp(nameQuery, "i") },
-        { nativePlace: new RegExp(nameQuery, "i") },
-      ],
-    };
-    const qProfileIds = (await Profile.find(profileSearchFilter).select("_id")).map((profile) => profile._id);
-    const nameConditions = [
-      { firstName: new RegExp(nameQuery, "i") },
-      { lastName: new RegExp(nameQuery, "i") },
-    ];
-    const searchConditions = qProfileIds.length > 0
-      ? [...nameConditions, { additionalDetails: { $in: qProfileIds } }]
-      : nameConditions;
+    if (isAdmin) {
+      const profileSearchFilter = {
+        ...(baseProfileIds ? { _id: { $in: baseProfileIds } } : {}),
+        $or: [
+          { profession: new RegExp(nameQuery, "i") },
+          { currentCity: new RegExp(nameQuery, "i") },
+          { education: new RegExp(nameQuery, "i") },
+          { nativePlace: new RegExp(nameQuery, "i") },
+        ],
+      };
+      const qProfileIds = (await Profile.find(profileSearchFilter).select("_id")).map((profile) => profile._id);
+      const nameConditions = [
+        { firstName: new RegExp(nameQuery, "i") },
+        { lastName: new RegExp(nameQuery, "i") },
+      ];
+      const searchConditions = qProfileIds.length > 0
+        ? [...nameConditions, { additionalDetails: { $in: qProfileIds } }]
+        : nameConditions;
 
-    userFilter.$and = [
-      ...(userFilter.additionalDetails ? [{ additionalDetails: userFilter.additionalDetails }] : []),
-      { $or: searchConditions },
-    ];
-    delete userFilter.additionalDetails;
+      userFilter.$and = [
+        ...(userFilter.additionalDetails ? [{ additionalDetails: userFilter.additionalDetails }] : []),
+        { $or: searchConditions },
+      ];
+      delete userFilter.additionalDetails;
+    } else {
+      // Normal members: strictly search by member name (no data leak via search)
+      userFilter.$or = [
+        { firstName: new RegExp(nameQuery, "i") },
+        { lastName: new RegExp(nameQuery, "i") },
+      ];
+    }
+  }
+
+  let queryBuilder = User.find(userFilter)
+    .sort({ firstName: 1, lastName: 1 })
+    .skip(skip)
+    .limit(limit);
+
+  if (isAdmin) {
+    queryBuilder = queryBuilder
+      .populate("additionalDetails")
+      .populate("family", "familyName familyCode currentCity nativePlace");
+  } else {
+    // Normal members: select only _id, firstName, lastName
+    queryBuilder = queryBuilder.select("_id firstName lastName");
   }
 
   const [users, total] = await Promise.all([
-    User.find(userFilter)
-      .populate("additionalDetails")
-      .populate("family", "familyName familyCode currentCity nativePlace")
-      .sort({ firstName: 1, lastName: 1 })
-      .skip(skip)
-      .limit(limit),
+    queryBuilder,
     User.countDocuments(userFilter),
   ]);
 
+  const sanitizedMembers = users.map((directoryUser) => {
+    if (!isAdmin) {
+      return {
+        _id: directoryUser._id,
+        firstName: directoryUser.firstName,
+        lastName: directoryUser.lastName,
+      };
+    }
+    return projectDirectoryUser(directoryUser, req.user);
+  });
+
   return res.status(200).json(new ApiResponse("Member directory fetched successfully", {
-    members: users.map((directoryUser) => projectDirectoryUser(directoryUser, req.user)),
+    members: sanitizedMembers,
   }, {
     page,
     limit,

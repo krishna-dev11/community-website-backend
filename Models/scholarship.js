@@ -1,5 +1,16 @@
 const mongoose = require("mongoose");
 
+const fileSchema = new mongoose.Schema({
+  name: String,
+  instructions: String,
+  url: String,
+  publicId: String,
+  fileName: String,
+  mimeType: String,
+  size: Number,
+  uploadedAt: Date,
+}, { _id: false });
+
 const scholarshipSchema = new mongoose.Schema({
   title: {
     type: String,
@@ -11,6 +22,14 @@ const scholarshipSchema = new mongoose.Schema({
     required: true,
   },
   eligibility: String,
+  requiredDocument: {
+    enabled: { type: Boolean, default: false },
+    name: { type: String, trim: true },
+    instructions: { type: String, trim: true },
+    file: fileSchema,
+  },
+  requiredDocumentName: { type: String, trim: true },
+  requiredDocumentDescription: { type: String, trim: true },
   amount: Number,
   seats: {
     type: Number,

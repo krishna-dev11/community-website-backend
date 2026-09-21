@@ -13,6 +13,7 @@ const {
   razorpayWebhook,
   generateMonthlyContributions,
   listContributions,
+  listMyFinancialHistory,
   recordOfflineContributionPayment,
   waiveContribution,
   markOverdueContributions,
@@ -45,6 +46,7 @@ router.get("/me/contributions", auth, (req, res, next) => {
   req.query.mine = "true";
   next();
 }, listContributions);
+router.get("/me/financial-history", auth, listMyFinancialHistory);
 router.patch("/contributions/:contributionId/payments/offline", auth, authorize("contribution:update"), recordOfflineContributionPayment);
 router.patch("/contributions/:contributionId/waive", auth, authorize("contribution:update"), waiveContribution);
 router.post("/contributions/mark-overdue", auth, authorize("contribution:update"), markOverdueContributions);

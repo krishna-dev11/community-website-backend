@@ -25,6 +25,7 @@ const scholarshipApplicationSchema = new mongoose.Schema({
   educationDetails: String,
   incomeDetails: String,
   statement: String,
+  requiredDocument: fileSchema,
   documents: [fileSchema],
   status: {
     type: String,
@@ -38,6 +39,7 @@ const scholarshipApplicationSchema = new mongoose.Schema({
   },
   reviewedAt: Date,
   reviewReason: String,
+  reviewNote: String,
 }, { timestamps: true });
 
 scholarshipApplicationSchema.index({ scholarship: 1, applicant: 1 }, { unique: true });

@@ -8,6 +8,9 @@ const MonthlyContribution = require("../Models/monthlyContribution");
 const Poll = require("../Models/poll");
 const Shradhanjali = require("../Models/shradhanjali");
 const User = require("../Models/user");
+const DharamshalaBooking = require("../Models/dharamshalaBooking");
+const DharamshalaReservationHold = require("../Models/dharamshalaReservationHold");
+const { notifyUser } = require("./notificationService");
 
 async function expireTimeBoundRecords() {
   const now = new Date();
@@ -49,6 +52,25 @@ async function expireTimeBoundRecords() {
     ),
   ]);
 
+  const expiredBookings = await DharamshalaBooking.find({ status: "PAYMENT_PENDING", paymentDeadline: { $lte: now } })
+    .select("_id requester bookingReference statusHistory");
+  await Promise.all(expiredBookings.map(async (booking) => {
+    booking.status = "PAYMENT_EXPIRED";
+    booking.paymentStatus = "FAILED";
+    booking.statusHistory = booking.statusHistory || [];
+    booking.statusHistory.push({ status: "PAYMENT_EXPIRED", paymentStatus: "FAILED", changedAt: now, note: "Payment deadline expired" });
+    await booking.save();
+    await DharamshalaReservationHold.deleteMany({ booking: booking._id });
+    if (booking.requester) {
+      await notifyUser({
+        recipient: booking.requester,
+        title: "Dharamshala payment expired",
+        message: `Payment window for booking ${booking.bookingReference || booking._id} has expired.`,
+        metadata: { booking: booking._id },
+      });
+    }
+  }));
+
   const changed =
     notices.modifiedCount +
     jobs.modifiedCount +
@@ -57,7 +79,7 @@ async function expireTimeBoundRecords() {
     contributions.modifiedCount +
     polls.modifiedCount +
     shradhanjalis.modifiedCount +
-    staleDonations.modifiedCount;
+    staleDonations.modifiedCount + expiredBookings.length;
 
   if (changed > 0) {
     console.log("Scheduled cron sweep completed", {
@@ -69,6 +91,7 @@ async function expireTimeBoundRecords() {
       polls: polls.modifiedCount,
       shradhanjalis: shradhanjalis.modifiedCount,
       staleDonations: staleDonations.modifiedCount,
+      dharamshalaPaymentsExpired: expiredBookings.length,
     });
   }
 }

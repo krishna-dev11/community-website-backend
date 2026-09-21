@@ -1,8 +1,10 @@
 const crypto = require("node:crypto");
+const mongoose = require("mongoose");
 const DonationCampaign = require("../Models/donationCampaign");
 const Donation = require("../Models/donation");
 const MonthlyContribution = require("../Models/monthlyContribution");
 const WebhookEvent = require("../Models/webhookEvent");
+const DharamshalaPayment = require("../Models/dharamshalaPayment");
 const User = require("../Models/user");
 const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
@@ -10,6 +12,7 @@ const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
 const { notifyUser } = require("../Utilities/notificationService");
 const { instance: razorpay } = require("../config/RazorpayInstance");
+const { confirmDharamshalaWebhookPayment } = require("../Utilities/dharamshalaPaymentService");
 
 function pageOptions(query) {
   const page = Math.max(Number(query.page) || 1, 1);
@@ -469,6 +472,21 @@ exports.razorpayWebhook = asyncHandler(async (req, res) => {
     const orderId = payment.order_id;
     const notes = payment.notes || {};
 
+    if (notes.type === "dharamshala") {
+      try {
+        await confirmDharamshalaWebhookPayment({
+          orderId,
+          paymentId: payment.id,
+          eventId,
+          amount: payment.amount,
+        });
+        await WebhookEvent.findOneAndUpdate({ eventId }, { status: "PROCESSED", processedAt: new Date() });
+      } catch (error) {
+        await WebhookEvent.findOneAndUpdate({ eventId }, { status: "FAILED", error: error.message });
+      }
+      return res.status(200).json({ success: true });
+    }
+
     const donation = await Donation.findOne({ razorpayOrderId: orderId, status: "PENDING" });
     if (donation) {
       donation.status = "SUCCESS";
@@ -518,6 +536,13 @@ exports.razorpayWebhook = asyncHandler(async (req, res) => {
   }
 
   if (payload.event === "payment.failed") {
+    const dharamshalaPayment = await DharamshalaPayment.findOneAndUpdate(
+      { gatewayOrderId: payment.order_id, status: { $in: ["CREATED", "PENDING"] } },
+      { status: "FAILED", gatewayPaymentId: payment.id, failedAt: new Date() },
+      { new: true }
+    );
+    if (dharamshalaPayment) return res.status(200).json({ success: true });
+
     const donation = await Donation.findOneAndUpdate(
       { razorpayOrderId: payment.order_id, status: "PENDING" },
       {
@@ -587,6 +612,56 @@ exports.listContributions = asyncHandler(async (req, res) => {
     { path: "family", select: "familyName familyCode" },
   ]);
   return res.status(200).json(new ApiResponse("Contributions fetched successfully", { contributions: items }, meta));
+});
+
+exports.listMyFinancialHistory = asyncHandler(async (req, res) => {
+  const memberId = new mongoose.Types.ObjectId(req.user.id);
+  const [donations, contributions, donationSummary, contributionSummary] = await Promise.all([
+    Donation.find({ donor: memberId }).populate("campaign", "title").sort({ paidAt: -1, createdAt: -1 }).limit(100),
+    MonthlyContribution.find({ member: memberId }).sort({ year: -1, month: -1 }).limit(100),
+    Donation.aggregate([
+      { $match: { donor: memberId, status: "SUCCESS" } },
+      { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 }, lastDate: { $max: "$paidAt" } } },
+    ]),
+    MonthlyContribution.aggregate([
+      { $match: { member: memberId } },
+      { $group: { _id: null, total: { $sum: "$paidAmount" }, count: { $sum: 1 }, lastDate: { $max: "$updatedAt" } } },
+    ]),
+  ]);
+  const donationTotals = donationSummary[0] || { total: 0, count: 0, lastDate: null };
+  const contributionTotals = contributionSummary[0] || { total: 0, count: 0, lastDate: null };
+  const records = [
+    ...donations.map((item) => ({
+      _id: item._id,
+      type: "Donation",
+      purpose: item.campaign?.title || "General Donation",
+      amount: item.amount,
+      status: item.status,
+      date: item.paidAt || item.createdAt,
+      paymentMethod: item.razorpayPaymentId ? "Online" : "Not recorded",
+      receiptNumber: item.receiptNumber,
+      note: item.note,
+    })),
+    ...contributions.map((item) => ({
+      _id: item._id,
+      type: "Monthly Contribution",
+      purpose: `Samaj Monthly Contribution - ${item.month}/${item.year}`,
+      amount: item.paidAmount,
+      status: item.status,
+      date: item.updatedAt || item.createdAt,
+      paymentMethod: item.paymentHistory?.at(-1)?.mode || "Not recorded",
+      receiptNumber: item.paymentHistory?.at(-1)?.razorpayPaymentId,
+      note: item.paymentHistory?.at(-1)?.note,
+    })),
+  ].sort((a, b) => new Date(b.date) - new Date(a.date));
+  return res.status(200).json(new ApiResponse("Financial history fetched successfully", {
+    records,
+    summary: {
+      totalContributed: Number(donationTotals.total || 0) + Number(contributionTotals.total || 0),
+      contributionCount: Number(donationTotals.count || 0) + Number(contributionTotals.count || 0),
+      lastContribution: [donationTotals.lastDate, contributionTotals.lastDate].filter(Boolean).sort().at(-1) || null,
+    },
+  }));
 });
 
 exports.recordOfflineContributionPayment = asyncHandler(async (req, res) => {

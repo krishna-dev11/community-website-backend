@@ -129,7 +129,11 @@ async function uploadPublicationPdf(file, folder = "samaj/publications") {
   try {
     validateUploadFile(file, { maxSizeMB: 20, allowedMimes: ALLOWED_PUBLICATION_MIMES });
 
-    const isPdf = (file.mimetype === "application/pdf") || (file.name || "").toLowerCase().endsWith(".pdf");
+    const fileName = (file.name || file.originalname || "").toLowerCase();
+    const isPdf = file.mimetype === "application/pdf" && fileName.endsWith(".pdf");
+    if (!isPdf) {
+      throw new ApiError(400, "INVALID_PUBLICATION_PDF", "Publication full edition must be a valid .pdf file");
+    }
 
     const options = {
       folder,

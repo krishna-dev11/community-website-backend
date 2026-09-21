@@ -8,7 +8,6 @@ const {
   listUsers,
   updateUserStatus,
   anonymizeUserAccount,
-  listAuditLogs,
 } = require("../Controllers/Admin");
 const { auth, authorize } = require("../Middlewares/auth");
 
@@ -22,6 +21,5 @@ router.patch("/users/:userId/roles", auth, authorize("admin:roles"), updateUserR
 router.get("/users", auth, authorize("admin:users"), listUsers);
 router.patch("/users/:userId/status", auth, authorize("admin:users"), updateUserStatus);
 router.patch("/users/:userId/anonymize", auth, authorize("admin:users"), anonymizeUserAccount);
-router.get("/audit-logs", auth, authorize("audit:read"), listAuditLogs);
 
 module.exports = router;

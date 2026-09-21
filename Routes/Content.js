@@ -13,6 +13,8 @@ const {
   publishPublication,
   archivePublication,
   trackPublicationDownload,
+  viewPublication,
+  downloadPublication,
   listManagementMembers,
   upsertManagementMember,
   archiveManagementMember,
@@ -28,6 +30,13 @@ const {
   listGalleryPhotos,
   addGalleryPhotos,
   archiveGalleryPhoto,
+  listVideos,
+  listVideosAdmin,
+  createVideo,
+  updateVideo,
+  publishVideo,
+  unpublishVideo,
+  deleteVideo,
 } = require("../Controllers/Content");
 const { auth, authorize } = require("../Middlewares/auth");
 
@@ -47,6 +56,8 @@ router.patch("/publications/:publicationId", auth, authorize("publication:update
 router.patch("/publications/:publicationId/publish", auth, authorize("publication:publish"), publishPublication);
 router.patch("/publications/:publicationId/archive", auth, authorize("publication:archive"), archivePublication);
 router.post("/publications/:publicationId/download", trackPublicationDownload);
+router.get("/publications/:publicationId/view-file", viewPublication);
+router.get("/publications/:publicationId/download-file", downloadPublication);
 
 router.get("/management", listManagementMembers);
 router.post("/management", auth, authorize("management:create"), upsertManagementMember);
@@ -68,5 +79,13 @@ router.patch("/gallery/albums/:albumId/archive", auth, authorize("gallery:archiv
 router.get("/gallery/albums/:albumId/photos", listGalleryPhotos);
 router.post("/gallery/albums/:albumId/photos", auth, authorize("gallery:create"), addGalleryPhotos);
 router.patch("/gallery/albums/:albumId/photos/:photoId/archive", auth, authorize("gallery:archive"), archiveGalleryPhoto);
+
+router.get("/videos", listVideos);
+router.get("/admin/videos", auth, authorize("video:read"), listVideosAdmin);
+router.post("/videos", auth, authorize("video:create"), createVideo);
+router.patch("/videos/:videoId", auth, authorize("video:update"), updateVideo);
+router.patch("/videos/:videoId/publish", auth, authorize("video:update"), publishVideo);
+router.patch("/videos/:videoId/unpublish", auth, authorize("video:update"), unpublishVideo);
+router.delete("/videos/:videoId", auth, authorize("video:delete"), deleteVideo);
 
 module.exports = router;

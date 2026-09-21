@@ -3,7 +3,6 @@ const bcrypt = require("bcryptjs");
 const User = require("../Models/user");
 const Profile = require("../Models/profile");
 const AdminInvite = require("../Models/adminInvite");
-const AuditLog = require("../Models/auditLog");
 const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
@@ -413,31 +412,3 @@ exports.anonymizeUserAccount = asyncHandler(async (req, res) => {
   }));
 });
 
-exports.listAuditLogs = asyncHandler(async (req, res) => {
-  const page = Math.max(Number(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
-  const skip = (page - 1) * limit;
-  const filter = {};
-
-  if (req.query.action) filter.action = req.query.action;
-  if (req.query.actor) filter.actor = req.query.actor;
-  if (req.query.targetType) filter.targetType = req.query.targetType;
-  if (req.query.target) filter.target = req.query.target;
-
-  const [logs, total] = await Promise.all([
-    AuditLog.find(filter)
-      .populate("actor", "firstName lastName email roles")
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit),
-    AuditLog.countDocuments(filter),
-  ]);
-
-  return res.status(200).json(new ApiResponse("Audit logs fetched successfully", {
-    logs,
-  }, {
-    page,
-    limit,
-    total,
-  }));
-});

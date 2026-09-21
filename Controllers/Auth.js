@@ -20,8 +20,8 @@ const {
 } = require("../Utilities/uploadImageToCloudinary");
 require("dotenv").config();
 
-const ACCESS_TOKEN_TTL = "15m";
-const REFRESH_TOKEN_DAYS = 30;
+const ACCESS_TOKEN_TTL = "7d";
+const REFRESH_TOKEN_DAYS = 7;
 const MAX_FAILED_LOGINS = 5;
 const LOCK_MINUTES = 15;
 
@@ -119,7 +119,7 @@ async function issueSession(user, req, res) {
 
   res.cookie("refreshToken", refreshToken, refreshCookieOptions());
   res.cookie("token", accessToken, {
-    maxAge: 15 * 60 * 1000,
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "strict",

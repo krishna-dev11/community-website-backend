@@ -16,6 +16,7 @@ const {
   listDharamshalaBookings,
   reviewDharamshalaBooking,
   cancelDharamshalaBooking,
+  updateDharamshalaBookingLifecycle,
   checkDharamshalaAvailability,
   createDharamshalaBlockedDate,
   listDharamshalaBlockedDates,
@@ -45,6 +46,12 @@ const {
   verifyMembershipCard,
 } = require("../Controllers/Community");
 const { auth, optionalAuth, authorize } = require("../Middlewares/auth");
+const {
+  createDharamshalaPaymentOrder,
+  verifyDharamshalaPayment,
+  listMyDharamshalaPayments,
+  refundDharamshalaPayment,
+} = require("../Controllers/DharamshalaPayment");
 
 const router = express.Router();
 
@@ -66,6 +73,10 @@ router.patch("/dharamshalas/:id", auth, authorize("dharamshala:block"), updateDh
 
 // Booking & Availability (supports both authenticated members and guest non-members)
 router.post("/dharamshala/bookings", optionalAuth, createDharamshalaBooking);
+router.post("/dharamshala/bookings/:bookingId/payment-order", auth, createDharamshalaPaymentOrder);
+router.post("/dharamshala/payments/verify", auth, verifyDharamshalaPayment);
+router.get("/me/dharamshala/payments", auth, listMyDharamshalaPayments);
+router.post("/dharamshala/payments/:paymentId/refund", auth, authorize("dharamshala:review"), refundDharamshalaPayment);
 router.get("/dharamshala/availability", checkDharamshalaAvailability);
 router.get("/dharamshala/bookings", auth, authorize("dharamshala:read"), listDharamshalaBookings);
 router.get("/me/dharamshala/bookings", auth, (req, res, next) => {
@@ -73,6 +84,7 @@ router.get("/me/dharamshala/bookings", auth, (req, res, next) => {
   next();
 }, listDharamshalaBookings);
 router.patch("/dharamshala/bookings/:bookingId/review", auth, authorize("dharamshala:review"), reviewDharamshalaBooking);
+router.patch("/dharamshala/bookings/:bookingId/lifecycle", auth, authorize("dharamshala:review"), updateDharamshalaBookingLifecycle);
 router.patch("/dharamshala/bookings/:bookingId/cancel", auth, cancelDharamshalaBooking);
 router.post("/dharamshala/blocked-dates", auth, authorize("dharamshala:block"), createDharamshalaBlockedDate);
 router.get("/dharamshala/blocked-dates", auth, authorize("dharamshala:read"), listDharamshalaBlockedDates);

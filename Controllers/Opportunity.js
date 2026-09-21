@@ -7,7 +7,7 @@ const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
 const { notifyUser } = require("../Utilities/notificationService");
-const { uploadImageToCloudinary } = require("../Utilities/uploadImageToCloudinary");
+const { uploadImageToCloudinary, uploadDocumentToCloudinary, assetMetadata } = require("../Utilities/uploadImageToCloudinary");
 const { hasPermission } = require("../constants/permissions");
 
 function pageOptions(query) {
@@ -365,7 +365,40 @@ function scholarshipPayload(body) {
   ["title", "description", "eligibility", "amount", "seats", "applicationDeadline", "status"].forEach((field) => {
     if (body[field] !== undefined) payload[field] = body[field];
   });
+  if (body.requiredDocument !== undefined) {
+    payload.requiredDocument = typeof body.requiredDocument === "string"
+      ? JSON.parse(body.requiredDocument)
+      : body.requiredDocument;
+  }
+  if (body.requiredDocumentName !== undefined || body.requiredDocumentDescription !== undefined) {
+    payload.requiredDocument = {
+      enabled: Boolean(body.requiredDocumentName),
+      name: body.requiredDocumentName,
+      instructions: body.requiredDocumentDescription,
+    };
+  }
   return payload;
+}
+
+async function scholarshipRequiredDocument(req, existing = null) {
+  const config = req.body.requiredDocument
+    ? (typeof req.body.requiredDocument === "string" ? JSON.parse(req.body.requiredDocument) : req.body.requiredDocument)
+    : existing?.requiredDocument;
+  if (!config?.enabled) return config ? { enabled: false } : existing?.requiredDocument;
+  if (!config.name?.trim()) throw new ApiError(400, "SCHOLARSHIP_DOCUMENT_NAME_REQUIRED", "Required document name is required");
+  const referenceFile = req.files?.requiredDocumentFile;
+  let file = config.file || existing?.requiredDocument?.file;
+  if (referenceFile) {
+    const uploaded = await uploadDocumentToCloudinary(referenceFile, process.env.CLOUDINARY_SCHOLARSHIP_FOLDER || "samaj/scholarships/reference-documents", false);
+    file = { ...assetMetadata(uploaded, referenceFile.name || referenceFile.originalname), fileName: referenceFile.name || referenceFile.originalname, mimeType: referenceFile.mimetype, uploadedAt: new Date() };
+  }
+  return { enabled: true, name: config.name.trim(), instructions: config.instructions?.trim() || "", file };
+}
+
+function scholarshipDocumentConfig(scholarship) {
+  const config = scholarship?.requiredDocument || {};
+  const name = config.name || scholarship?.requiredDocumentName || "";
+  return { ...config, enabled: Boolean(config.enabled ?? name), name, instructions: config.instructions || scholarship?.requiredDocumentDescription || "" };
 }
 
 exports.listScholarships = asyncHandler(async (req, res) => {
@@ -393,8 +426,14 @@ exports.createScholarship = asyncHandler(async (req, res) => {
     throw new ApiError(400, "INVALID_SCHOLARSHIP_DEADLINE", "Deadline must be in the future");
   }
 
+  const payload = scholarshipPayload(req.body);
+  payload.requiredDocument = await scholarshipRequiredDocument(req);
+  if (payload.status === "OPEN" && !payload.requiredDocument?.enabled) {
+    throw new ApiError(400, "SCHOLARSHIP_DOCUMENT_REQUIRED", "Open scholarships must configure a required applicant document");
+  }
+
   const scholarship = await Scholarship.create({
-    ...scholarshipPayload(req.body),
+    ...payload,
     createdBy: req.user.id,
     updatedBy: req.user.id,
     publishedAt: req.body.status === "OPEN" ? new Date() : undefined,
@@ -421,7 +460,11 @@ exports.updateScholarship = asyncHandler(async (req, res) => {
     throw new ApiError(400, "INVALID_SCHOLARSHIP_DEADLINE", "Deadline must be in the future");
   }
 
-  Object.assign(scholarship, scholarshipPayload(req.body), { updatedBy: req.user.id });
+  const payload = scholarshipPayload(req.body);
+  if (req.body.requiredDocument !== undefined || req.files?.requiredDocumentFile) {
+    payload.requiredDocument = await scholarshipRequiredDocument(req, scholarship);
+  }
+  Object.assign(scholarship, payload, { updatedBy: req.user.id });
   if (req.body.status === "OPEN") scholarship.publishedAt = scholarship.publishedAt || new Date();
   await scholarship.save();
 
@@ -471,19 +514,47 @@ exports.applyForScholarship = asyncHandler(async (req, res) => {
   if (!scholarship) {
     throw new ApiError(404, "SCHOLARSHIP_NOT_OPEN", "Scholarship is not open for applications");
   }
+  if (scholarship.seats && scholarship.approvedCount >= scholarship.seats) {
+    throw new ApiError(409, "SCHOLARSHIP_SEATS_FULL", "No scholarship seats are available");
+  }
+  if (await ScholarshipApplication.exists({ scholarship: scholarship._id, applicant: req.user.id })) {
+    throw new ApiError(409, "SCHOLARSHIP_ALREADY_APPLIED", "You have already applied for this scholarship");
+  }
 
-  const uploaded = await uploadFiles(req.files?.documents || req.files?.document, process.env.CLOUDINARY_SCHOLARSHIP_FOLDER || "samaj/scholarships/documents");
-  const bodyDocs = asArray(req.body.documents).map(assetFromBody).filter(Boolean);
+  const uploadedFiles = req.files?.documents || req.files?.document;
+  const uploaded = uploadedFiles
+    ? await Promise.all(asArray(uploadedFiles).map(async (file) => {
+      const result = await uploadDocumentToCloudinary(file, process.env.CLOUDINARY_SCHOLARSHIP_FOLDER || "samaj/scholarships/documents", true);
+      return { ...assetMetadata(result, file.name || file.originalname), fileName: file.name || file.originalname, mimeType: file.mimetype, uploadedAt: new Date() };
+    }))
+    : [];
+  const documentConfig = scholarshipDocumentConfig(scholarship);
+  if (documentConfig.enabled && uploaded.length === 0) {
+    throw new ApiError(400, "SCHOLARSHIP_DOCUMENT_REQUIRED", `Please upload: ${documentConfig.name}`);
+  }
 
-  const application = await ScholarshipApplication.create({
-    scholarship: scholarship._id,
-    applicant: req.user.id,
-    applicantName: req.body.applicantName,
-    educationDetails: req.body.educationDetails,
-    incomeDetails: req.body.incomeDetails,
-    statement: req.body.statement,
-    documents: [...bodyDocs, ...uploaded],
-  });
+  const requiredDocument = uploaded[0]
+    ? { ...uploaded[0], name: documentConfig.name || uploaded[0].name, instructions: documentConfig.instructions }
+    : undefined;
+
+  let application;
+  try {
+    application = await ScholarshipApplication.create({
+      scholarship: scholarship._id,
+      applicant: req.user.id,
+      applicantName: req.body.applicantName,
+      educationDetails: req.body.educationDetails,
+      incomeDetails: req.body.incomeDetails,
+      statement: req.body.statement,
+      requiredDocument,
+      documents: uploaded,
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      throw new ApiError(409, "SCHOLARSHIP_ALREADY_APPLIED", "You have already applied for this scholarship");
+    }
+    throw error;
+  }
 
   await logAudit({
     actor: req.user.id,
@@ -524,6 +595,9 @@ exports.reviewScholarshipApplication = asyncHandler(async (req, res) => {
   if (!["UNDER_REVIEW", "SHORTLISTED", "APPROVED", "REJECTED", "REOPENED"].includes(status)) {
     throw new ApiError(400, "INVALID_SCHOLARSHIP_APPLICATION_STATUS", "Invalid application status");
   }
+  if (status === "REJECTED" && !String(reason || "").trim()) {
+    throw new ApiError(400, "REJECTION_REASON_REQUIRED", "A rejection reason is required");
+  }
 
   const application = await ScholarshipApplication.findById(req.params.applicationId).populate("scholarship");
   if (!application) throw new ApiError(404, "SCHOLARSHIP_APPLICATION_NOT_FOUND", "Scholarship application was not found");
@@ -544,6 +618,7 @@ exports.reviewScholarshipApplication = asyncHandler(async (req, res) => {
   application.reviewedBy = req.user.id;
   application.reviewedAt = new Date();
   application.reviewReason = reason;
+  application.reviewNote = reason;
   await application.save();
 
   await notifyUser({

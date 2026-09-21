@@ -5,7 +5,7 @@ const ROLE_PERMISSIONS = {
   SCHOLARSHIP_ADMIN: ["scholarship:*"],
   JOB_ADMIN: ["job:*"],
   DHARAMSHALA_ADMIN: ["dharamshala:*"],
-  CONTENT_ADMIN: ["notice:*", "publication:*", "gallery:*", "management:*", "cms:*"],
+  CONTENT_ADMIN: ["notice:*", "publication:*", "gallery:*", "video:*", "management:*", "cms:*"],
   MODERATOR: ["community:moderate", "issue:read", "issue:moderate", "shradhanjali:review", "achievement:review"],
   MEMBER: [
     "profile:self",

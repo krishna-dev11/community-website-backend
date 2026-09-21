@@ -1,9 +1,11 @@
 const mongoose = require("mongoose");
+const crypto = require("node:crypto");
 const Issue = require("../Models/issue");
 const IssueResponse = require("../Models/issueResponse");
 const Dharamshala = require("../Models/dharamshala");
 const DharamshalaBooking = require("../Models/dharamshalaBooking");
 const DharamshalaBlockedDate = require("../Models/dharamshalaBlockedDate");
+const DharamshalaReservationHold = require("../Models/dharamshalaReservationHold");
 const Poll = require("../Models/poll");
 const Vote = require("../Models/vote");
 const VoteParticipation = require("../Models/voteParticipation");
@@ -17,6 +19,9 @@ const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
 const { logAudit } = require("../Utilities/auditService");
+const { notifyUser } = require("../Utilities/notificationService");
+const { mailSender } = require("../Utilities/mailSender");
+const { getDharamshalaPrice, serializeDharamshala } = require("../Utilities/dharamshalaPricing");
 const {
   uploadImageToCloudinary,
   uploadDocumentToCloudinary,
@@ -48,7 +53,60 @@ function assertDateRange(startDate, endDate) {
   if (!startDate || !endDate || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) {
     throw new ApiError(400, "INVALID_DATE_RANGE", "Start date must be before end date");
   }
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (start < today) throw new ApiError(400, "PAST_CHECKIN_DATE", "Check-in date cannot be in the past");
   return { start, end };
+}
+
+function bookingReference() {
+  const year = new Date().getFullYear();
+  return `DH-${year}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+}
+
+function addBookingHistory(booking, status, paymentStatus, changedBy, note) {
+  booking.statusHistory = booking.statusHistory || [];
+  booking.statusHistory.push({ status, paymentStatus, changedBy, note });
+}
+
+function reservationDates(start, end) {
+  const dates = [];
+  for (const cursor = new Date(start); cursor < end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    dates.push(cursor.toISOString().slice(0, 10));
+  }
+  return dates;
+}
+
+async function reserveDharamshalaSlots(booking, roomConfig) {
+  const claimed = [];
+  try {
+    for (const date of reservationDates(booking.startDate, booking.endDate)) {
+      let claimedForDate = 0;
+      for (let slot = 0; slot < roomConfig.totalRooms && claimedForDate < booking.roomsRequested; slot += 1) {
+        try {
+          const hold = await DharamshalaReservationHold.create({
+            booking: booking._id,
+            dharamshala: booking.dharamshala,
+            roomType: booking.roomType,
+            date,
+            slot,
+          });
+          claimed.push(hold._id);
+          claimedForDate += 1;
+        } catch (error) {
+          if (error.code !== 11000) throw error;
+        }
+      }
+      if (claimedForDate < booking.roomsRequested) throw new ApiError(409, "DHARAMSHALA_ROOMS_UNAVAILABLE", "The selected room is no longer available for all requested dates");
+    }
+  } catch (error) {
+    await DharamshalaReservationHold.deleteMany({ _id: { $in: claimed } });
+    throw error;
+  }
+}
+
+async function releaseDharamshalaSlots(bookingId) {
+  await DharamshalaReservationHold.deleteMany({ booking: bookingId });
 }
 
 function assetFromBody(asset) {
@@ -68,7 +126,7 @@ function canEditOwned(resourceUserId, req) {
 
 async function getDharamshalaConflicts(startDate, endDate, excludeBookingId = null, dharamshalaId = null, roomType = null) {
   const bookingFilter = {
-    status: { $in: ["APPROVED", "PENDING"] },
+    status: { $in: ["PENDING", "APPROVED", "PAYMENT_PENDING", "CONFIRMED", "CHECKED_IN"] },
     startDate: { $lt: endDate },
     endDate: { $gt: startDate },
   };
@@ -92,149 +150,72 @@ async function getDharamshalaConflicts(startDate, endDate, excludeBookingId = nu
 
 const DEFAULT_DHARAMSHALAS = [
   {
-    name: "Shree Samaj Bhavan & Yatri Niwas",
-    slug: "haridwar-samaj-bhavan",
-    tagline: "Serene & peaceful stay near Ganga Ghats",
-    description: "Located within walking distance from Har Ki Pauri, Shree Samaj Bhavan offers clean, comfortable, and peaceful accommodation for Samaj members, pilgrims, and families visiting Haridwar.",
+    name: "Halba Samaj Dharamshala",
+    slug: "halba-samaj-dharamshala-ujjain",
+    tagline: "Shri Vitthal Mandir, Narsingh Ghat Road, Ujjain",
+    description: "Official guest facility of Halba Samaj, Ujjain. Providing clean and peaceful accommodation with 5 Rooms (2 AC with Attached Toilet, 3 Non-AC with Non-Attached Toilet) and 1 Big Hall.",
     location: {
-      address: "Plot 14-16, Ganga Vihar, Near Har Ki Pauri Bypass",
-      city: "Haridwar",
-      state: "Uttarakhand",
-      pincode: "249401",
-      landmark: "Opposite Shantikunj Road",
+      address: "Shri Vitthal Mandir, Narsingh Ghat Road, Kalika Mata Mandir ke pichhe",
+      city: "Ujjain",
+      state: "Madhya Pradesh",
+      pincode: "456006",
+      landmark: "Kalika Mata Mandir ke pichhe, Narsingh Ghat",
     },
     mainImage: "",
+    images: [],
     roomTypes: [
       {
-        name: "Standard Non-AC Room",
-        description: "Cozy room with double bed, attached washroom, fan and 24-hour hot water.",
-        capacity: 2,
-        totalRooms: 10,
-        memberPricePerNight: 400,
-        nonMemberPricePerNight: 900,
-        amenities: ["Double Bed", "Attached Bathroom", "Geyser", "Ceiling Fan", "Wardrobe"],
+        name: "AC Room (Attached Toilet)",
+        description: "Double room with attached toilet. Maximum 4 persons per room.",
+        capacity: 4,
+        totalRooms: 2,
+        pricePerNight: 1200,
+        amenities: ["Air Conditioning", "Attached Toilet", "Double Bed"],
       },
       {
-        name: "Deluxe AC Room",
-        description: "Spacious air-conditioned room with premium bedding, television and balcony.",
-        capacity: 3,
-        totalRooms: 12,
-        memberPricePerNight: 800,
-        nonMemberPricePerNight: 1600,
-        amenities: ["Air Conditioning", "Double Bed + Extra Mattress", "Attached Bathroom", "Smart TV", "Geyser", "Balcony View"],
+        name: "Non-AC Room (Non-Attached Toilet)",
+        description: "Double room with non-attached toilet. Maximum 4 persons per room.",
+        capacity: 4,
+        totalRooms: 3,
+        pricePerNight: 800,
+        amenities: ["Ceiling Fan", "Non-Attached Toilet", "Double Bed"],
       },
       {
-        name: "Family Suite (4 Bedded)",
-        description: "Ideal for large families with 4 single beds or 2 double beds and spacious seating.",
-        capacity: 5,
-        totalRooms: 6,
-        memberPricePerNight: 1200,
-        nonMemberPricePerNight: 2400,
-        amenities: ["Air Conditioning", "2 Double Beds", "2 Attached Washrooms", "Living Area", "Tea Maker", "WiFi"],
+        name: "Big Hall",
+        description: "1 Big Hall for community gatherings and large pilgrim groups.",
+        capacity: 25,
+        totalRooms: 1,
+        pricePerNight: 3000,
+        amenities: ["Spacious Hall", "Clean Facilities"],
       },
-      {
-        name: "Community Dormitory",
-        description: "Affordable air-cooled dormitory beds with clean locker facilities for individual pilgrims.",
-        capacity: 1,
-        totalRooms: 20,
-        memberPricePerNight: 150,
-        nonMemberPricePerNight: 350,
-        amenities: ["Single Cot", "Personal Locker", "Shared Washrooms", "Cooler", "Filtered RO Water"],
-      }
     ],
     facilities: [
-      "Pure Vegetarian Bhojanshala (Mahaprasad)",
-      "24/7 Security & CCTV Surveillance",
-      "Elevator (Lift) Access",
-      "Free Parking for Guests",
-      "Hot Water / Geysers",
-      "24/7 Power Backup",
-      "Community Satsang Hall",
-      "RO Drinking Water",
-      "Luggage Storage",
-      "Free High-Speed Wi-Fi in Lobby"
+      "5 Rooms (All Double, Max 4 persons per room)",
+      "1 Big Hall",
+      "2 AC Rooms with Attached Toilet",
+      "3 Non-AC Rooms with Non-Attached Toilet",
+      "Shri Vitthal Mandir Campus",
+      "Narsingh Ghat Road, Behind Kalika Mata Mandir, Ujjain",
     ],
     rules: [
-      "Valid Government ID card is mandatory at check-in for all guests",
-      "Strictly pure vegetarian premises. Non-veg food and alcohol are strictly prohibited",
-      "Smoking, tobacco, and consumption of intoxicants are prohibited",
-      "Quiet hours are observed between 10:00 PM and 6:00 AM",
-      "Check-in time is 12:00 PM and check-out time is 10:00 AM"
+      "Original ID is mandatory",
+      "Smoking prohibited",
+      "Drinking prohibited",
+      "Non-veg prohibited",
+      "Guest is responsible for their valuables",
+      "Check-in: 12:00 AM (Timing to be confirmed), Check-out: 10:00 AM",
+      "Cancellation before 24 hours: 50% refund, After 24 hours: No refund",
     ],
-    checkInTime: "12:00 PM",
+    checkInTime: "12:00 AM",
     checkOutTime: "10:00 AM",
-    cancellationPolicy: "Full refund if cancelled at least 48 hours prior to check-in. 50% refund within 24-48 hours.",
-    contactPhone: "+91 98765 43210",
-    contactEmail: "dharamshala.haridwar@samaj.org",
+    cancellationPolicy: "Before 24 hours: 50% refund. After 24 hours: No refund.",
+    contactPhone: "+91 88271 96257",
+    contactEmail: "admin@halbasamaj.org",
     status: "ACTIVE",
-    totalCapacity: 85,
+    totalCapacity: 45,
   },
-  {
-    name: "Shri Kutch Samaj Atithi Griha",
-    slug: "varanasi-samaj-atithi-griha",
-    tagline: "Divine stay on the banks of Sacred Kashi",
-    description: "Centrally located in the spiritual heart of Varanasi, Shri Kutch Samaj Atithi Griha provides modern conveniences combined with traditional Samaj hospitality for devotees and travelers.",
-    location: {
-      address: "B-22/104, Godowlia Road, Near Dashashwamedh Ghat",
-      city: "Varanasi",
-      state: "Uttar Pradesh",
-      pincode: "221001",
-      landmark: "500m from Kashi Vishwanath Temple Corridor",
-    },
-    mainImage: "",
-    roomTypes: [
-      {
-        name: "Standard AC Room",
-        description: "Well-appointed air-conditioned room with modern bathroom amenities.",
-        capacity: 2,
-        totalRooms: 8,
-        memberPricePerNight: 700,
-        nonMemberPricePerNight: 1400,
-        amenities: ["Air Conditioning", "Queen Bed", "Attached Bathroom", "LED TV", "Geyser"],
-      },
-      {
-        name: "Executive AC Room",
-        description: "Comfortable large room with extra seating, desk and complimentary Wi-Fi.",
-        capacity: 3,
-        totalRooms: 6,
-        memberPricePerNight: 1000,
-        nonMemberPricePerNight: 2000,
-        amenities: ["Split AC", "King Bed", "Work Desk", "Intercom", "Modern Bathroom", "Electric Kettle"],
-      },
-      {
-        name: "Family Dorm (6 Beds)",
-        description: "Spacious hall suited for group pilgrimages and family yatras.",
-        capacity: 6,
-        totalRooms: 4,
-        memberPricePerNight: 1500,
-        nonMemberPricePerNight: 3000,
-        amenities: ["Air Cooling", "6 Single Beds", "2 Attached Bathrooms", "Lockers"],
-      }
-    ],
-    facilities: [
-      "Pure Vegetarian Dining Facility",
-      "Temple Corridor Shuttle Assistance",
-      "24/7 Reception Desk",
-      "Wi-Fi Connectivity",
-      "Generator Backup",
-      "Elevator",
-      "Wheelchair Accessible"
-    ],
-    rules: [
-      "Government Photo ID required at check-in",
-      "No smoking or alcohol permitted on the premises",
-      "Guests are requested to maintain spiritual decorum",
-      "Early check-in subject to availability"
-    ],
-    checkInTime: "12:00 PM",
-    checkOutTime: "11:00 AM",
-    cancellationPolicy: "Cancellations made 48 hours before check-in receive a 100% refund.",
-    contactPhone: "+91 98222 11334",
-    contactEmail: "varanasi.stay@samaj.org",
-    status: "ACTIVE",
-    totalCapacity: 60,
-  }
 ];
+
 
 exports.createIssue = asyncHandler(async (req, res) => {
   const { title, description, category, location, priority } = req.body;
@@ -449,7 +430,9 @@ exports.getDharamshalas = asyncHandler(async (req, res) => {
     }
   }
 
-  return res.status(200).json(new ApiResponse("Dharamshalas fetched successfully", { dharamshalas: list }));
+  return res.status(200).json(new ApiResponse("Dharamshalas fetched successfully", {
+    dharamshalas: list.map(serializeDharamshala),
+  }));
 });
 
 exports.getDharamshalaById = asyncHandler(async (req, res) => {
@@ -462,7 +445,9 @@ exports.getDharamshalaById = asyncHandler(async (req, res) => {
     throw new ApiError(404, "DHARAMSHALA_NOT_FOUND", "Dharamshala not found");
   }
 
-  return res.status(200).json(new ApiResponse("Dharamshala details fetched", { dharamshala }));
+  return res.status(200).json(new ApiResponse("Dharamshala details fetched", {
+    dharamshala: serializeDharamshala(dharamshala),
+  }));
 });
 
 exports.createDharamshala = asyncHandler(async (req, res) => {
@@ -503,8 +488,14 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
   if (!req.body.purpose) throw new ApiError(400, "BOOKING_PURPOSE_REQUIRED", "Purpose of visit is required");
   if (!req.body.roomType) throw new ApiError(400, "ROOM_TYPE_REQUIRED", "Room type is required");
 
-  const roomsRequested = Math.max(Number(req.body.roomsRequested) || 1, 1);
-  const numberOfGuests = Math.max(Number(req.body.numberOfGuests) || 1, 1);
+  const roomsRequested = Number(req.body.roomsRequested);
+  const numberOfGuests = Number(req.body.numberOfGuests);
+  if (!Number.isInteger(roomsRequested) || roomsRequested < 1) {
+    throw new ApiError(400, "INVALID_ROOM_COUNT", "Number of rooms must be at least 1");
+  }
+  if (!Number.isInteger(numberOfGuests) || numberOfGuests < 1) {
+    throw new ApiError(400, "INVALID_GUEST_COUNT", "Number of guests must be at least 1");
+  }
 
   // 1. Verify Dharamshala exists
   let dharamshala = null;
@@ -517,7 +508,13 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
 
   // 2. Check room capacity & availability (Double-booking protection)
   const roomConfig = dharamshala?.roomTypes?.find((r) => r.name === req.body.roomType);
-  const totalCapacity = roomConfig?.totalRooms || 5;
+  if (!dharamshala || !roomConfig) {
+    throw new ApiError(404, "ROOM_TYPE_NOT_FOUND", "Selected room type is not available");
+  }
+  if (numberOfGuests > roomConfig.capacity * roomsRequested) {
+    throw new ApiError(400, "GUEST_CAPACITY_EXCEEDED", `This room type supports up to ${roomConfig.capacity * roomsRequested} guests`);
+  }
+  const totalCapacity = roomConfig.totalRooms;
 
   const conflicts = await getDharamshalaConflicts(start, end, null, dharamshala?._id, req.body.roomType);
   if (conflicts.blockedDates.length > 0) {
@@ -543,9 +540,10 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
   }
 
   // 4. Calculate pricing server-side
-  const memberRate = roomConfig?.memberPricePerNight || 400;
-  const nonMemberRate = roomConfig?.nonMemberPricePerNight || 900;
-  const appliedRate = isMember ? memberRate : nonMemberRate;
+  const appliedRate = getDharamshalaPrice(roomConfig);
+  if (!appliedRate) {
+    throw new ApiError(422, "DHARAMSHALA_PRICE_UNAVAILABLE", "Pricing is unavailable for this room type. Please contact the Dharamshala team.");
+  }
 
   const oneDayMs = 1000 * 60 * 60 * 24;
   const numberOfNights = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / oneDayMs));
@@ -555,6 +553,14 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
   const guestName = isMember ? `${requesterUser.firstName} ${requesterUser.lastName}` : (req.body.guestName || "Guest");
   const guestEmail = isMember ? requesterUser.email : (req.body.guestEmail || "");
   const guestPhone = req.body.guestPhone || (isMember ? requesterUser.contactNumber : "");
+  const idempotencyKey = req.get("Idempotency-Key");
+
+  if (idempotencyKey) {
+    const existingBooking = await DharamshalaBooking.findOne({ idempotencyKey });
+    if (existingBooking) {
+      return res.status(200).json(new ApiResponse("Existing Dharamshala booking request", { booking: existingBooking }));
+    }
+  }
 
   const duplicateFilter = {
     dharamshala: dharamshala?._id,
@@ -574,11 +580,13 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
   }
 
   const booking = await DharamshalaBooking.create({
+    bookingReference: bookingReference(),
+    idempotencyKey,
     dharamshala: dharamshala?._id,
     dharamshalaName: dharamshala?.name || "Samaj Dharamshala",
     roomType: req.body.roomType,
     requester: req.user?.id || null,
-    isMember,
+    isMember: false,
     guestName,
     guestEmail,
     guestPhone,
@@ -592,14 +600,36 @@ exports.createDharamshalaBooking = asyncHandler(async (req, res) => {
     numberOfNights,
     totalAmount,
     specialRequests: req.body.specialRequests || "",
-    paymentStatus: isMember ? "PENDING" : "PENDING",
+    paymentStatus: "NOT_REQUIRED",
     status: "PENDING",
+    statusHistory: [{ status: "PENDING", paymentStatus: "NOT_REQUIRED", changedBy: req.user?.id }],
   });
+  try {
+    await reserveDharamshalaSlots(booking, roomConfig);
+  } catch (error) {
+    await DharamshalaBooking.deleteOne({ _id: booking._id });
+    throw error;
+  }
 
+  const adminEmail = process.env.DHARAMSHALA_ADMIN_EMAIL || dharamshala.contactEmail;
+  if (adminEmail) {
+    Promise.resolve(mailSender(
+      adminEmail,
+      `New Dharamshala Booking Request - ${booking.bookingReference}`,
+      `<p>New booking request <strong>${booking.bookingReference}</strong>.</p><p>${guestName} requested ${req.body.roomType} from ${start.toLocaleDateString("en-IN")} to ${end.toLocaleDateString("en-IN")} for ${numberOfGuests} guest(s).</p>`
+    )).catch((error) => console.error("Dharamshala admin email failed:", error.message));
+  }
+  if (req.user?.id) {
+    await notifyUser({
+      recipient: req.user.id,
+      title: "Dharamshala booking request submitted",
+      message: `Your booking request ${booking.bookingReference} is waiting for admin approval.`,
+      metadata: { booking: booking._id, bookingReference: booking.bookingReference },
+    });
+  }
   return res.status(201).json(new ApiResponse("Dharamshala booking requested successfully", {
     booking,
     pricingBreakdown: {
-      isMember,
       ratePerNight: appliedRate,
       numberOfNights,
       roomsRequested,
@@ -639,24 +669,54 @@ exports.reviewDharamshalaBooking = asyncHandler(async (req, res) => {
   if (!["APPROVE", "REJECT"].includes(action)) {
     throw new ApiError(400, "INVALID_BOOKING_REVIEW_ACTION", "Action must be APPROVE or REJECT");
   }
+  if (action === "REJECT" && !note) {
+    throw new ApiError(400, "REJECTION_REASON_REQUIRED", "A rejection reason is required");
+  }
 
   const booking = await DharamshalaBooking.findOne({ _id: req.params.bookingId, status: "PENDING" });
   if (!booking) throw new ApiError(404, "BOOKING_NOT_REVIEWABLE", "Booking was not found or already reviewed");
 
   if (action === "APPROVE") {
     const conflicts = await getDharamshalaConflicts(booking.startDate, booking.endDate, booking._id);
-    if (conflicts.bookings.length || conflicts.blockedDates.length) {
+    const sameRoomConflicts = conflicts.bookings.filter((item) => (
+      String(item.dharamshala) === String(booking.dharamshala) && item.roomType === booking.roomType
+    ));
+    const dharamshala = await Dharamshala.findById(booking.dharamshala);
+    const roomConfig = dharamshala?.roomTypes?.find((room) => room.name === booking.roomType);
+    const bookedRooms = sameRoomConflicts.reduce((sum, item) => sum + (item.roomsRequested || 1), 0);
+    if (conflicts.blockedDates.length || !roomConfig || bookedRooms + booking.roomsRequested > roomConfig.totalRooms) {
       throw new ApiError(409, "DHARAMSHALA_DATES_UNAVAILABLE", "These dates are no longer available");
     }
   }
 
+  if (action === "REJECT") await releaseDharamshalaSlots(booking._id);
+
   const previousStatus = booking.status;
-  booking.status = action === "APPROVE" ? "APPROVED" : "REJECTED";
+  booking.status = action === "APPROVE" ? "PAYMENT_PENDING" : "REJECTED";
+  booking.paymentStatus = action === "APPROVE" ? "PENDING" : "NOT_APPLICABLE";
   booking.reviewedBy = req.user.id;
   booking.reviewedAt = new Date();
+  booking.approvedAt = action === "APPROVE" ? new Date() : undefined;
+  booking.paymentDeadline = action === "APPROVE"
+    ? new Date(Date.now() + (Number(process.env.DHARAMSHALA_PAYMENT_HOLD_HOURS) || 24) * 60 * 60 * 1000)
+    : undefined;
   booking.reviewMessage = note || (action === "APPROVE" ? "Booking approved by administrator" : "");
   booking.reviewNote = note || (action === "APPROVE" ? "Booking approved by administrator" : "");
+  booking.rejectionReason = action === "REJECT" ? note : undefined;
+  addBookingHistory(booking, booking.status, booking.paymentStatus, req.user.id, note);
   await booking.save();
+
+  if (booking.requester) {
+    await notifyUser({
+      recipient: booking.requester,
+      title: action === "APPROVE" ? "Dharamshala booking approved" : "Dharamshala booking rejected",
+      message: action === "APPROVE"
+        ? `Booking ${booking.bookingReference} is approved. Complete payment before ${booking.paymentDeadline.toLocaleString("en-IN")} to confirm it.`
+        : `Booking ${booking.bookingReference} was rejected. Reason: ${note}`,
+      email: true,
+      metadata: { booking: booking._id, bookingReference: booking.bookingReference, status: booking.status },
+    });
+  }
 
   await logAudit({
     actor: req.user.id,
@@ -674,7 +734,7 @@ exports.reviewDharamshalaBooking = asyncHandler(async (req, res) => {
 
 exports.cancelDharamshalaBooking = asyncHandler(async (req, res) => {
   const booking = await DharamshalaBooking.findById(req.params.bookingId);
-  if (!booking || ["CANCELLED", "ARCHIVED"].includes(booking.status)) {
+  if (!booking || ["CANCELLED", "ARCHIVED", "COMPLETED"].includes(booking.status)) {
     throw new ApiError(404, "BOOKING_NOT_FOUND", "Booking was not found");
   }
   if (!canEditOwned(booking.requester, req) && !(req.user.roles || []).some((role) => ["DHARAMSHALA_ADMIN", "SUPER_ADMIN", "Admin"].includes(role))) {
@@ -683,15 +743,50 @@ exports.cancelDharamshalaBooking = asyncHandler(async (req, res) => {
 
   const reason = (req.body.reason || req.body.cancellationReason || req.body.reviewMessage || "Cancelled by user").trim();
   booking.status = "CANCELLED";
+  booking.paymentStatus = booking.paymentStatus === "SUCCESS" ? "REFUND_PENDING" : "NOT_APPLICABLE";
   booking.cancelledBy = req.user.id;
   booking.cancelledAt = new Date();
   booking.cancellationReason = reason;
+  addBookingHistory(booking, booking.status, booking.paymentStatus, req.user.id, reason);
   await booking.save();
+  await releaseDharamshalaSlots(booking._id);
   return res.status(200).json(new ApiResponse("Booking cancelled successfully", { booking }));
+});
+
+exports.updateDharamshalaBookingLifecycle = asyncHandler(async (req, res) => {
+  const { action } = req.body;
+  const booking = await DharamshalaBooking.findById(req.params.bookingId);
+  if (!booking) throw new ApiError(404, "BOOKING_NOT_FOUND", "Booking was not found");
+  const allowed = { CHECK_IN: ["CONFIRMED"], COMPLETE: ["CHECKED_IN"] };
+  if (!allowed[action]?.includes(booking.status)) {
+    throw new ApiError(409, "INVALID_BOOKING_TRANSITION", `Cannot ${action} a booking in ${booking.status} status`);
+  }
+  booking.status = action === "CHECK_IN" ? "CHECKED_IN" : "COMPLETED";
+  if (action === "CHECK_IN") booking.checkedInAt = new Date();
+  if (action === "COMPLETE") booking.completedAt = new Date();
+  addBookingHistory(booking, booking.status, booking.paymentStatus, req.user.id, `Admin action: ${action}`);
+  await booking.save();
+  if (booking.requester) {
+    await notifyUser({
+      recipient: booking.requester,
+      title: `Dharamshala booking ${booking.status.toLowerCase()}`,
+      message: `Booking ${booking.bookingReference || booking._id} is now ${booking.status}.`,
+      metadata: { booking: booking._id },
+    });
+  }
+  return res.status(200).json(new ApiResponse("Dharamshala booking lifecycle updated", { booking }));
 });
 
 exports.checkDharamshalaAvailability = asyncHandler(async (req, res) => {
   const { start, end } = assertDateRange(req.query.startDate, req.query.endDate);
+  const dharamshala = req.query.dharamshalaId
+    ? await Dharamshala.findById(req.query.dharamshalaId)
+    : await Dharamshala.findOne({ status: "ACTIVE" });
+  const roomConfig = dharamshala?.roomTypes?.find((room) => room.name === req.query.roomType);
+  if (!dharamshala || !roomConfig) {
+    throw new ApiError(404, "ROOM_TYPE_NOT_FOUND", "Selected room type is not available");
+  }
+  const requestedRooms = Math.max(Number(req.query.roomsRequested) || 1, 1);
   const conflicts = await getDharamshalaConflicts(
     start,
     end,
@@ -699,8 +794,14 @@ exports.checkDharamshalaAvailability = asyncHandler(async (req, res) => {
     req.query.dharamshalaId,
     req.query.roomType
   );
+  const bookedRooms = conflicts.bookings.reduce((sum, booking) => sum + (booking.roomsRequested || 1), 0);
+  const availableRooms = Math.max(0, roomConfig.totalRooms - bookedRooms);
   return res.status(200).json(new ApiResponse("Dharamshala availability checked", {
-    available: conflicts.blockedDates.length === 0,
+    available: conflicts.blockedDates.length === 0 && availableRooms >= requestedRooms,
+    totalRooms: roomConfig.totalRooms,
+    bookedRooms,
+    availableRooms,
+    requestedRooms,
     conflicts,
   }));
 });
