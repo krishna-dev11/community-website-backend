@@ -14,6 +14,7 @@ const shradhanjaliSchema = new mongoose.Schema({
     size: Number,
     mimeType: String,
     name: String,
+    uploadedAt: Date,
   },
   supportingDocument: {
     url: String,
@@ -21,6 +22,7 @@ const shradhanjaliSchema = new mongoose.Schema({
     size: Number,
     mimeType: String,
     name: String,
+    uploadedAt: Date,
   },
   status: { type: String, enum: ["PENDING", "PUBLISHED", "REJECTED", "ARCHIVED"], default: "PENDING", index: true },
   submittedBy: { type: mongoose.Schema.Types.ObjectId, ref: "user", required: true },

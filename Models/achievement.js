@@ -14,6 +14,7 @@ const achievementSchema = new mongoose.Schema({
     size: Number,
     mimeType: String,
     name: String,
+    uploadedAt: Date,
   },
   recipientPhoto: {
     url: String,
@@ -21,6 +22,7 @@ const achievementSchema = new mongoose.Schema({
     size: Number,
     mimeType: String,
     name: String,
+    uploadedAt: Date,
   },
   supportingDocument: {
     url: String,
@@ -28,6 +30,7 @@ const achievementSchema = new mongoose.Schema({
     size: Number,
     mimeType: String,
     name: String,
+    uploadedAt: Date,
   },
   verificationBadge: { type: Boolean, default: true },
   status: { type: String, enum: ["PENDING", "PUBLISHED", "REJECTED", "ARCHIVED"], default: "PENDING", index: true },

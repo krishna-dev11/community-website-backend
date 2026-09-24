@@ -42,6 +42,7 @@ const {
   createShradhanjali,
   listShradhanjalis,
   reviewShradhanjali,
+  getShradhanjaliSupportingDocument,
   getMyMembershipCard,
   verifyMembershipCard,
 } = require("../Controllers/Community");
@@ -124,11 +125,13 @@ router.get("/admin/shradhanjalis", auth, authorize("shradhanjali:review"), (req,
   req.query.admin = "true";
   next();
 }, listShradhanjalis);
+router.get("/admin/shradhanjalis/:shradhanjaliId/supporting-document", auth, authorize("shradhanjali:review"), getShradhanjaliSupportingDocument);
 router.get("/me/shradhanjalis", auth, authorize("shradhanjali:create"), (req, res, next) => {
   req.query.mine = "true";
   next();
 }, listShradhanjalis);
 router.get("/shradhanjalis", listShradhanjalis);
+router.get("/shradhanjalis/:shradhanjaliId/supporting-document", auth, authorize("shradhanjali:review"), getShradhanjaliSupportingDocument);
 router.patch("/shradhanjalis/:shradhanjaliId/review", auth, authorize("shradhanjali:review"), reviewShradhanjali);
 
 router.get("/membership-cards/me", auth, getMyMembershipCard);

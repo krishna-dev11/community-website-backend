@@ -5,6 +5,8 @@ const {
   createJob,
   updateJob,
   moderateJob,
+  listMyJobs,
+  reportJob,
   applyToJob,
   listJobApplications,
   listMyJobApplications,
@@ -23,16 +25,26 @@ const { auth, authorize } = require("../Middlewares/auth");
 
 const router = express.Router();
 
+// ── Jobs (Public) ──────────────────────────────────────────────────────────
 router.get("/jobs", listJobs);
-router.get("/admin/jobs", auth, authorize("job:moderate"), listJobsAdmin);
+
+// ── Jobs (Member Auth) ─────────────────────────────────────────────────────
 router.post("/jobs", auth, createJob);
 router.patch("/jobs/:jobId", auth, updateJob);
+router.get("/me/jobs", auth, listMyJobs);
+router.post("/jobs/:jobId/report", auth, reportJob);
+
+// ── Jobs (Admin) ───────────────────────────────────────────────────────────
+router.get("/admin/jobs", auth, authorize("job:moderate"), listJobsAdmin);
 router.patch("/admin/jobs/:jobId/moderate", auth, authorize("job:moderate"), moderateJob);
+
+// ── Job Applications (kept for backward compat, no new UI for jobs) ────────
 router.post("/jobs/:jobId/applications", auth, applyToJob);
 router.get("/jobs/:jobId/applications", auth, listJobApplications);
 router.get("/me/job-applications", auth, listMyJobApplications);
 router.patch("/job-applications/:applicationId/status", auth, updateJobApplicationStatus);
 
+// ── Scholarships ───────────────────────────────────────────────────────────
 router.get("/scholarships", listScholarships);
 router.get("/admin/scholarships", auth, authorize("scholarship:read"), listScholarshipsAdmin);
 router.post("/scholarships", auth, authorize("scholarship:create"), createScholarship);

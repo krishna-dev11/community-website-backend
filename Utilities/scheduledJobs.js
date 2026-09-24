@@ -5,6 +5,7 @@ const Scholarship = require("../Models/scholarship");
 const DonationCampaign = require("../Models/donationCampaign");
 const Donation = require("../Models/donation");
 const MonthlyContribution = require("../Models/monthlyContribution");
+const MonthlyContributionCycle = require("../Models/monthlyContributionCycle");
 const Poll = require("../Models/poll");
 const Shradhanjali = require("../Models/shradhanjali");
 const User = require("../Models/user");
@@ -100,8 +101,25 @@ async function autoGenerateMonthlyContributions() {
   const now = new Date();
   const month = now.getMonth() + 1;
   const year = now.getFullYear();
-  const dueDate = new Date(year, month - 1, 15); // Due on 15th of the month
-  const defaultAmount = Number(process.env.DEFAULT_MONTHLY_CONTRIBUTION || 100);
+  const dueStartDate = new Date(year, month - 1, 1);
+  const dueDate = new Date(year, month - 1, 10, 23, 59, 59); // 10th of the month
+  const defaultAmount = Number(process.env.DEFAULT_MONTHLY_CONTRIBUTION || 60);
+  const lateFeeAmount = 2;
+
+  let cycle = await MonthlyContributionCycle.findOne({ month, year });
+  if (!cycle) {
+    cycle = await MonthlyContributionCycle.create({
+      month,
+      year,
+      title: `${now.toLocaleString("en-US", { month: "long" })} ${year}`,
+      contributionAmount: defaultAmount,
+      dueStartDate,
+      dueDate,
+      lateFeeAmount,
+      description: `Monthly contribution cycle for ${now.toLocaleString("en-US", { month: "long" })} ${year}`,
+      status: "OPEN",
+    });
+  }
 
   const members = await User.find({ active: true, accountStatus: "ACTIVE", roles: "MEMBER" }).select("_id family");
   if (!members.length) return;
@@ -111,15 +129,19 @@ async function autoGenerateMonthlyContributions() {
       MonthlyContribution.create({
         member: member._id,
         family: member.family,
+        cycle: cycle._id,
         month,
         year,
-        expectedAmount: defaultAmount,
-        dueDate,
+        expectedAmount: cycle.contributionAmount || defaultAmount,
+        totalPayable: cycle.contributionAmount || defaultAmount,
+        dueStartDate,
+        dueDate: cycle.dueDate || dueDate,
       })
     )
   );
 
   const created = results.filter((r) => r.status === "fulfilled").length;
+  await MonthlyContributionCycle.findByIdAndUpdate(cycle._id, { eligibleMembersCount: members.length });
   console.log(`[Cron] Auto-generated ${created} monthly contributions for ${month}/${year}`);
 }
 

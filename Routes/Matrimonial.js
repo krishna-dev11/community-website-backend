@@ -10,6 +10,7 @@ const {
   removeMyMatrimonialProfile,
   expressInterest,
   listMyMatrimonialInterests,
+  getReceivedInterestProfile,
   respondToInterest,
   requestContactAccess,
   listMyContactRequests,
@@ -37,6 +38,7 @@ router.patch("/admin/profiles/:profileId/review", auth, authorize("matrimonial:r
 
 router.post("/profiles/:profileId/interests", auth, authorize("matrimonial:interest"), expressInterest);
 router.get("/interests/me", auth, authorize("matrimonial:read"), listMyMatrimonialInterests);
+router.get("/interests/:interestId/profile", auth, authorize("matrimonial:read"), getReceivedInterestProfile);
 router.patch("/interests/:interestId", auth, authorize("matrimonial:interest"), respondToInterest);
 
 router.post("/interests/:interestId/contact-requests", auth, authorize("matrimonial:contact"), requestContactAccess);

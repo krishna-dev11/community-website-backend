@@ -94,6 +94,12 @@ function jobPayload(body) {
     "contactEmail",
     "contactPhone",
     "expiresAt",
+    // New community job board fields
+    "contactPersonName",
+    "contactWhatsApp",
+    "preferredContactMethod",
+    "additionalContactNote",
+    "declarationAccepted",
   ].forEach((field) => {
     if (body[field] !== undefined) payload[field] = body[field];
   });
@@ -138,11 +144,28 @@ exports.createJob = asyncHandler(async (req, res) => {
     throw new ApiError(400, "JOB_FIELDS_REQUIRED", "Title, company name, and description are required");
   }
 
+  const isAdmin = canModerate(req, "job:moderate");
+
+  // Members must provide contact person + at least phone or email
+  if (!isAdmin) {
+    if (!req.body.contactPersonName?.trim()) {
+      throw new ApiError(400, "JOB_CONTACT_REQUIRED", "Contact person name is required");
+    }
+    if (!req.body.contactPhone?.trim() && !req.body.contactEmail?.trim()) {
+      throw new ApiError(400, "JOB_CONTACT_REQUIRED", "At least a phone number or email is required for job provider contact");
+    }
+  }
+
+  const now = new Date();
+  const publishDirectly = isAdmin && req.body.status === "PUBLISHED";
+
   const job = await Job.create({
     ...jobPayload(req.body),
-    status: canModerate(req, "job:moderate") && req.body.status === "PUBLISHED" ? "PUBLISHED" : "PENDING_MODERATION",
-    publishedAt: canModerate(req, "job:moderate") && req.body.status === "PUBLISHED" ? new Date() : undefined,
+    status: publishDirectly ? "PUBLISHED" : "PENDING_MODERATION",
+    publishedAt: publishDirectly ? now : undefined,
+    submittedAt: now,
     postedBy: req.user.id,
+    createdByRole: isAdmin ? "ADMIN" : "MEMBER",
   });
 
   await logAudit({
@@ -150,11 +173,14 @@ exports.createJob = asyncHandler(async (req, res) => {
     action: "job.created",
     targetType: "job",
     target: job._id,
-    newValue: { status: job.status, title: job.title },
+    newValue: { status: job.status, title: job.title, createdByRole: job.createdByRole },
     req,
   });
 
-  return res.status(201).json(new ApiResponse("Job submitted successfully", { job }));
+  return res.status(201).json(new ApiResponse(
+    isAdmin ? "Job created successfully" : "Job submitted for admin review. It will be published after approval.",
+    { job }
+  ));
 });
 
 exports.updateJob = asyncHandler(async (req, res) => {
@@ -162,41 +188,68 @@ exports.updateJob = asyncHandler(async (req, res) => {
   if (!job || job.status === "ARCHIVED") {
     throw new ApiError(404, "JOB_NOT_FOUND", "Job was not found");
   }
-  if (!isOwner(job.postedBy, req.user.id) && !canModerate(req, "job:moderate")) {
+
+  const isAdmin = canModerate(req, "job:moderate");
+  const isOwnerUser = isOwner(job.postedBy, req.user.id);
+
+  if (!isOwnerUser && !isAdmin) {
     throw new ApiError(403, "JOB_UPDATE_FORBIDDEN", "You cannot update this job");
   }
-  if (job.status === "PUBLISHED" && !canModerate(req, "job:moderate")) {
-    throw new ApiError(409, "PUBLISHED_JOB_LOCKED", "Published jobs can be edited by admins only");
+
+  // Members can only edit their own jobs that are REJECTED or CHANGES_REQUESTED
+  if (!isAdmin && isOwnerUser) {
+    if (!["REJECTED", "CHANGES_REQUESTED", "PENDING_MODERATION"].includes(job.status)) {
+      throw new ApiError(409, "JOB_NOT_EDITABLE", "You can only edit jobs that are pending review, rejected, or require changes");
+    }
   }
 
+  const oldStatus = job.status;
   Object.assign(job, jobPayload(req.body));
-  if (!canModerate(req, "job:moderate")) {
+
+  if (!isAdmin) {
+    // Member editing → always goes back to pending review
     job.status = "PENDING_MODERATION";
+    job.submittedAt = new Date();
+    job.reviewNote = undefined; // Clear old changes note
+    job.moderationReason = undefined;
   }
+
   await job.save();
 
   await logAudit({
     actor: req.user.id,
-    action: "job.updated",
+    action: isAdmin ? "job.updated" : "job.resubmitted",
     targetType: "job",
     target: job._id,
+    oldValue: { status: oldStatus },
     newValue: { status: job.status, title: job.title },
     req,
   });
 
-  return res.status(200).json(new ApiResponse("Job updated successfully", { job }));
+  return res.status(200).json(new ApiResponse(
+    isAdmin ? "Job updated successfully" : "Job updated and resubmitted for review.",
+    { job }
+  ));
 });
 
 exports.moderateJob = asyncHandler(async (req, res) => {
   const { action, reason } = req.body;
-  const nextStatus = {
-    PUBLISH: "PUBLISHED",
-    REJECT: "REJECTED",
-    EXPIRE: "EXPIRED",
-    ARCHIVE: "ARCHIVED",
-  }[action];
+  const ACTION_MAP = {
+    PUBLISH:         "PUBLISHED",
+    REJECT:          "REJECTED",
+    EXPIRE:          "EXPIRED",
+    ARCHIVE:         "ARCHIVED",
+    REQUEST_CHANGES: "CHANGES_REQUESTED",
+  };
+  const nextStatus = ACTION_MAP[action];
   if (!nextStatus) {
-    throw new ApiError(400, "INVALID_JOB_ACTION", "Action must be PUBLISH, REJECT, EXPIRE, or ARCHIVE");
+    throw new ApiError(400, "INVALID_JOB_ACTION", "Action must be PUBLISH, REJECT, EXPIRE, ARCHIVE, or REQUEST_CHANGES");
+  }
+  if (action === "REQUEST_CHANGES" && !reason?.trim()) {
+    throw new ApiError(400, "REASON_REQUIRED", "A note describing required changes must be provided");
+  }
+  if (action === "REJECT" && !reason?.trim()) {
+    throw new ApiError(400, "REASON_REQUIRED", "A rejection reason is required");
   }
 
   const job = await Job.findById(req.params.jobId);
@@ -206,7 +259,8 @@ exports.moderateJob = asyncHandler(async (req, res) => {
   job.status = nextStatus;
   job.moderatedBy = req.user.id;
   job.moderatedAt = new Date();
-  job.moderationReason = reason;
+  job.moderationReason = action === "REJECT" ? reason : job.moderationReason;
+  job.reviewNote = action === "REQUEST_CHANGES" ? reason : undefined;
   if (nextStatus === "PUBLISHED") job.publishedAt = job.publishedAt || new Date();
   if (nextStatus === "ARCHIVED") {
     job.archivedAt = new Date();
@@ -215,16 +269,26 @@ exports.moderateJob = asyncHandler(async (req, res) => {
   }
   await job.save();
 
-  await notifyUser({
-    recipient: job.postedBy,
-    title: "Job post reviewed",
-    message: `Your job post "${job.title}" is now ${job.status}.`,
-    metadata: { job: job._id, status: job.status, reason },
-  });
+  const notifMessages = {
+    PUBLISHED:         { title: "Job Approved!", message: `Your job posting "${job.title}" has been approved and is now live on the Jobs portal.` },
+    REJECTED:          { title: "Job Not Approved", message: `Your job posting "${job.title}" was not approved. Reason: ${reason || "See admin notes."}` },
+    CHANGES_REQUESTED: { title: "Changes Needed", message: `Your job posting "${job.title}" needs changes before it can be published. Note: ${reason}` },
+    EXPIRED:           { title: "Job Expired", message: `Your job posting "${job.title}" has expired and is no longer visible.` },
+    ARCHIVED:          { title: "Job Archived", message: `Your job posting "${job.title}" has been archived.` },
+  };
+  const notif = notifMessages[nextStatus];
+  if (notif) {
+    await notifyUser({
+      recipient: job.postedBy,
+      title: notif.title,
+      message: notif.message,
+      metadata: { job: job._id, status: job.status, reason },
+    });
+  }
 
   await logAudit({
     actor: req.user.id,
-    action: `job.${nextStatus.toLowerCase()}`,
+    action: `job.${action.toLowerCase()}`,
     targetType: "job",
     target: job._id,
     oldValue: { status: oldStatus },
@@ -234,6 +298,35 @@ exports.moderateJob = asyncHandler(async (req, res) => {
   });
 
   return res.status(200).json(new ApiResponse("Job moderated successfully", { job }));
+});
+
+exports.listMyJobs = asyncHandler(async (req, res) => {
+  const filter = { postedBy: req.user.id };
+  if (req.query.status) filter.status = req.query.status;
+  const { items, meta } = await paged(Job, filter, req.query, { createdAt: -1 });
+  return res.status(200).json(new ApiResponse("My jobs fetched successfully", { jobs: items }, meta));
+});
+
+exports.reportJob = asyncHandler(async (req, res) => {
+  const { reason, description } = req.body;
+  if (!reason) throw new ApiError(400, "REPORT_REASON_REQUIRED", "A report reason is required");
+
+  const job = await Job.findOne({
+    _id: req.params.jobId,
+    status: { $in: ["PUBLISHED", "PENDING_MODERATION", "CHANGES_REQUESTED"] },
+  });
+  if (!job) throw new ApiError(404, "JOB_NOT_FOUND", "Job was not found or is not reportable");
+
+  await logAudit({
+    actor: req.user.id,
+    action: "job.reported",
+    targetType: "job",
+    target: job._id,
+    newValue: { reason, description, jobTitle: job.title, jobStatus: job.status },
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Job reported successfully. The admin team will review your report."));
 });
 
 exports.applyToJob = asyncHandler(async (req, res) => {

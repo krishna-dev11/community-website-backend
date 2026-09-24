@@ -114,6 +114,26 @@ function sanitizeProfile(profile, includeProtected = false) {
   return output;
 }
 
+function sanitizeInterestProfile(profile) {
+  if (!profile) return profile;
+  const output = profile.toObject ? profile.toObject() : { ...profile };
+  output.age = ageFromDate(output.dateOfBirth);
+  delete output.protectedContact;
+  delete output.owner;
+  delete output.reviewedBy;
+  delete output.reviewReason;
+  delete output.archiveReason;
+  delete output.archivedBy;
+  delete output.__v;
+  if (output.guardian) {
+    output.guardian = {
+      name: output.guardian.name,
+      relation: output.guardian.relation,
+    };
+  }
+  return output;
+}
+
 function isAdmin(req) {
   return (req.user?.roles || []).some((role) => ["SUPER_ADMIN", "MATRIMONIAL_ADMIN", "Admin"].includes(role));
 }
@@ -127,9 +147,10 @@ async function canViewProtected(viewerProfileId, targetProfileId) {
   if (String(viewerProfileId) === String(targetProfileId)) return true;
   const approved = await MatrimonialContactRequest.exists({
     $or: [
-      { requesterProfile: viewerProfileId, targetProfile: targetProfileId, status: "APPROVED" },
-      { requesterProfile: targetProfileId, targetProfile: viewerProfileId, status: "APPROVED" },
+      { requesterProfile: viewerProfileId, targetProfile: targetProfileId },
+      { requesterProfile: targetProfileId, targetProfile: viewerProfileId },
     ],
+    status: "APPROVED",
   });
   return Boolean(approved);
 }
@@ -242,7 +263,7 @@ exports.getMatrimonialProfile = asyncHandler(async (req, res) => {
     throw new ApiError(404, "MATRIMONIAL_PROFILE_NOT_FOUND", "Matrimonial profile was not found");
   }
 
-  const includeProtected = isAdmin(req) || await canViewProtected(viewerProfile?._id, profile._id);
+  const includeProtected = await canViewProtected(viewerProfile?._id, profile._id);
   return res.status(200).json(new ApiResponse("Matrimonial profile fetched successfully", {
     profile: sanitizeProfile(profile, includeProtected),
     protectedContactUnlocked: includeProtected,
@@ -414,14 +435,38 @@ exports.listMyMatrimonialInterests = asyncHandler(async (req, res) => {
 
   const [sent, received] = await Promise.all([
     MatrimonialInterest.find({ fromProfile: profile._id })
-      .populate("toProfile", "displayName gender dateOfBirth currentCity profession photos status")
+      .populate("toProfile", "displayName gender dateOfBirth height maritalStatus education currentCity profession gotra nativePlace photos status")
       .sort({ createdAt: -1 }),
     MatrimonialInterest.find({ toProfile: profile._id })
-      .populate("fromProfile", "displayName gender dateOfBirth currentCity profession photos status")
+      .populate("fromProfile", "displayName gender dateOfBirth height maritalStatus education currentCity profession gotra nativePlace photos status")
       .sort({ createdAt: -1 }),
   ]);
 
   return res.status(200).json(new ApiResponse("Matrimonial interests fetched", { sent, received }));
+});
+
+exports.getReceivedInterestProfile = asyncHandler(async (req, res) => {
+  const myProfile = await getOwnProfile(req.user.id);
+  if (!myProfile) throw new ApiError(404, "MATRIMONIAL_PROFILE_NOT_FOUND", "Your matrimonial profile was not found");
+
+  const interest = await MatrimonialInterest.findOne({
+    _id: req.params.interestId,
+    toProfile: myProfile._id,
+  }).populate("fromProfile");
+
+  if (!interest || !interest.fromProfile || interest.fromProfile.status === "ARCHIVED") {
+    throw new ApiError(404, "INTEREST_PROFILE_NOT_FOUND", "Interest sender profile was not found");
+  }
+
+  return res.status(200).json(new ApiResponse("Interest sender profile fetched", {
+    interest: {
+      _id: interest._id,
+      status: interest.status,
+      message: interest.message,
+      createdAt: interest.createdAt,
+    },
+    profile: sanitizeInterestProfile(interest.fromProfile),
+  }));
 });
 
 exports.respondToInterest = asyncHandler(async (req, res) => {
@@ -520,6 +565,12 @@ exports.listMyContactRequests = asyncHandler(async (req, res) => {
     const obj = item.toObject ? item.toObject() : { ...item };
     if (obj.status !== "APPROVED" && obj.targetProfile) {
       delete obj.targetProfile.protectedContact;
+      if (obj.targetProfile.guardian) {
+        obj.targetProfile.guardian = {
+          name: obj.targetProfile.guardian.name,
+          relation: obj.targetProfile.guardian.relation,
+        };
+      }
     }
     return obj;
   });
@@ -528,6 +579,12 @@ exports.listMyContactRequests = asyncHandler(async (req, res) => {
     const obj = item.toObject ? item.toObject() : { ...item };
     if (obj.status !== "APPROVED" && obj.requesterProfile) {
       delete obj.requesterProfile.protectedContact;
+      if (obj.requesterProfile.guardian) {
+        obj.requesterProfile.guardian = {
+          name: obj.requesterProfile.guardian.name,
+          relation: obj.requesterProfile.guardian.relation,
+        };
+      }
     }
     return obj;
   });

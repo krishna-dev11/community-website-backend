@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const crypto = require("node:crypto");
+const cloudinary = require("cloudinary").v2;
 const Issue = require("../Models/issue");
 const IssueResponse = require("../Models/issueResponse");
 const Dharamshala = require("../Models/dharamshala");
@@ -27,6 +28,37 @@ const {
   uploadDocumentToCloudinary,
   assetMetadata,
 } = require("../Utilities/uploadImageToCloudinary");
+
+function isPdfAsset(asset = {}) {
+  const mime = String(asset.mimeType || "").toLowerCase();
+  const name = String(asset.name || asset.url || "").toLowerCase();
+  return mime.includes("pdf") || name.endsWith(".pdf") || name.includes(".pdf?");
+}
+
+function safeDocumentName(name, fallback = "supporting-document") {
+  return String(name || fallback).replace(/[\r\n\t"]/g, "_").replace(/[\\/]/g, "_").trim() || fallback;
+}
+
+function signedCloudinaryDocumentUrl(asset, { download = false } = {}) {
+  if (!asset?.publicId) return asset?.url;
+
+  const expiresAt = Math.floor(Date.now() / 1000) + 300;
+  const fileName = safeDocumentName(asset.name);
+  const options = {
+    type: "authenticated",
+    sign_url: true,
+    expires_at: expiresAt,
+    resource_type: isPdfAsset(asset) ? "image" : "image",
+    secure: true,
+  };
+
+  if (download) {
+    options.flags = "attachment";
+    options.attachment = fileName;
+  }
+
+  return cloudinary.url(asset.publicId, options);
+}
 
 function pageOptions(query) {
   const page = Math.max(Number(query.page) || 1, 1);
@@ -1239,6 +1271,43 @@ exports.reviewCommunityReport = asyncHandler(async (req, res) => {
   }
 
   return res.status(200).json(new ApiResponse("Community report reviewed", { report }));
+});
+
+exports.getShradhanjaliSupportingDocument = asyncHandler(async (req, res) => {
+  const item = await Shradhanjali.findById(req.params.shradhanjaliId).select("personName status supportingDocument");
+  if (!item || item.status === "ARCHIVED") {
+    throw new ApiError(404, "SHRADHANJALI_NOT_FOUND", "Tribute submission was not found");
+  }
+
+  const document = item.supportingDocument;
+  if (!document?.publicId && !document?.url) {
+    throw new ApiError(404, "DOCUMENT_NOT_FOUND", "Supporting document not available");
+  }
+
+  const action = req.query.download === "true" ? "DOCUMENT_DOWNLOADED" : "DOCUMENT_VIEWED";
+  await logAudit({
+    actor: req.user.id,
+    action,
+    targetType: "shradhanjali",
+    target: item._id,
+    metadata: {
+      documentName: document.name,
+      documentMimeType: document.mimeType,
+      documentSize: document.size,
+    },
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Supporting document URL generated", {
+    signedUrl: signedCloudinaryDocumentUrl(document, { download: req.query.download === "true" }),
+    expiresIn: document.publicId ? 300 : null,
+    documentMeta: {
+      name: document.name || "Supporting Document",
+      mimeType: document.mimeType,
+      size: document.size,
+      uploadedAt: document.uploadedAt,
+    },
+  }));
 });
 
 function createReviewableHandlers(Model, publicName, fields) {
