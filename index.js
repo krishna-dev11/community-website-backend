@@ -254,6 +254,7 @@ const allowedOrigins = [
   "http://localhost:3000",
 
   // Production frontend
+  "https://www.ujjainmahakaldarshnabooking.in",
   "https://halbahalbisamaj.vercel.app",
 
   // Additional origins from environment variables
