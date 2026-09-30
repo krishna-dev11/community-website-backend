@@ -1,58 +1,70 @@
-const nodemailer = require("nodemailer");
-const dns = require("node:dns");
+const { Resend } = require("resend");
 require("dotenv").config();
 
-if (dns.setDefaultResultOrder) {
-  dns.setDefaultResultOrder("ipv4first");
+let resendClient = null;
+
+function getResendClient() {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    return null;
+  }
+  if (!resendClient || resendClient.key !== apiKey) {
+    resendClient = new Resend(apiKey);
+    resendClient.key = apiKey;
+  }
+  return resendClient;
 }
 
+/**
+ * Sends an email using Resend API.
+ * @param {string|string[]} email - Recipient email address(es).
+ * @param {string} title - Email subject.
+ * @param {string} body - HTML email body.
+ * @returns {Promise<{success: boolean, messageId?: string, reason?: string}>}
+ */
 exports.mailSender = async (email, title, body) => {
-  const host = process.env.EMAIL_HOST || process.env.MAIL_HOST || "smtp.gmail.com";
-  const user = process.env.EMAIL_USER || process.env.MAIL_USER;
-  const pass = process.env.EMAIL_PASSWORD || process.env.MAIL_PASS;
-  const port = Number(process.env.EMAIL_PORT || process.env.MAIL_PORT) || (host.includes("gmail") ? 465 : 587);
-  const secure = port === 465;
+  const apiKey = process.env.RESEND_API_KEY;
 
-  if (!user || !pass) {
-    console.warn(`[mailSender] SMTP credentials (MAIL_USER / MAIL_PASS) are not configured in environment variables. Email to ${email} skipped.`);
-    return { success: false, reason: "SMTP_NOT_CONFIGURED" };
+  if (!apiKey) {
+    console.warn(
+      `[mailSender] RESEND_API_KEY is not configured in environment variables. Email to ${email} skipped.`
+    );
+    return { success: false, reason: "RESEND_API_KEY_NOT_CONFIGURED" };
   }
 
+  const recipients = Array.isArray(email) ? email : [email];
+  const fromAddress =
+    process.env.RESEND_FROM ||
+    process.env.EMAIL_FROM ||
+    "Halba Halbi Samaj <onboarding@resend.dev>";
+
   try {
-    console.log(`[mailSender] Sending email to: ${email} | Subject: "${title}" via ${host.includes("gmail") ? "Gmail Service" : `${host}:${port}`} (secure: ${secure})`);
+    const resend = getResendClient();
+    console.log(
+      `[mailSender] Sending email via Resend to: ${recipients.join(", ")} | Subject: "${title}" | From: "${fromAddress}"`
+    );
 
-    const transportOptions = {
-      auth: {
-        user,
-        pass,
-      },
-      tls: {
-        rejectUnauthorized: false,
-      },
-      family: 4,
-    };
-
-    if (host.includes("gmail")) {
-      transportOptions.service = "gmail";
-    } else {
-      transportOptions.host = host;
-      transportOptions.port = port;
-      transportOptions.secure = secure;
-    }
-
-    const transporter = nodemailer.createTransport(transportOptions);
-
-    const info = await transporter.sendMail({
-      from: process.env.EMAIL_FROM || `"Samaj Community Portal" <${user}>`,
-      to: `${email}`,
-      subject: `${title}`,
-      html: `${body}`,
+    const { data, error } = await resend.emails.send({
+      from: fromAddress,
+      to: recipients,
+      subject: title,
+      html: body,
     });
 
-    console.log(`[mailSender] Email sent successfully to ${email}. MessageId: ${info.messageId}`);
-    return { success: true, messageId: info.messageId };
+    if (error) {
+      console.error(`[mailSender] Resend error for ${recipients.join(", ")}:`, error);
+      throw new Error(error.message || "Failed to send email via Resend");
+    }
+
+    console.log(
+      `[mailSender] Email sent successfully via Resend to ${recipients.join(", ")}. Id: ${data?.id}`
+    );
+    return { success: true, messageId: data?.id };
   } catch (error) {
-    console.error(`[mailSender] Error sending email to ${email}:`, error.message);
+    console.error(
+      `[mailSender] Error sending email via Resend to ${recipients.join(", ")}:`,
+      error.message
+    );
     throw error;
   }
 };
