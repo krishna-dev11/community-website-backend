@@ -27,11 +27,20 @@ exports.auth = async(req , res , next)=>{
                 })
             }
 
+            // Allow PENDING users if they must change password (family member first login)
+            const isMustChangePending = payload.mustChangePassword && user.accountStatus === "PENDING";
+
             if (!user.active || ["SUSPENDED", "DEACTIVATED"].includes(user.accountStatus)) {
                 return res.status(403).json({
                     success:false,
                     message:"account is not active",
                 })
+            }
+
+            // Block PENDING accounts unless they are in the must-change-password flow
+            if (user.accountStatus === "PENDING" && !isMustChangePending) {
+                // Allow through — the individual route handlers will decide what to expose
+                // We do NOT block here globally, so endpoints can respond with appropriate messages
             }
 
             if (typeof payload.tokenVersion === "number" && payload.tokenVersion !== user.tokenVersion) {

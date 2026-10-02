@@ -16,6 +16,7 @@ const CommunityReport = require("../Models/communityReport");
 const Achievement = require("../Models/achievement");
 const Shradhanjali = require("../Models/shradhanjali");
 const User = require("../Models/user");
+const FamilyMembership = require("../Models/familyMembership");
 const ApiError = require("../Utilities/ApiError");
 const ApiResponse = require("../Utilities/ApiResponse");
 const asyncHandler = require("../Utilities/asyncHandler");
@@ -1438,37 +1439,220 @@ exports.createShradhanjali = shradhanjaliHandlers.create;
 exports.listShradhanjalis = shradhanjaliHandlers.list;
 exports.reviewShradhanjali = shradhanjaliHandlers.review;
 
+/**
+ * Helper: ensure a member has a secure verificationToken, generate one if missing
+ */
+async function ensureVerificationToken(userId) {
+  // Use +verificationToken to override select: false
+  const user = await User.findById(userId).select("+verificationToken");
+  if (!user) return null;
+  if (user.verificationToken) return user.verificationToken;
+  // Generate a cryptographically secure 48-byte hex token
+  const token = crypto.randomBytes(48).toString("hex");
+  await User.findByIdAndUpdate(userId, { verificationToken: token });
+  return token;
+}
+
 exports.getMyMembershipCard = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user.id)
-    .select("firstName lastName email imageUrl accountStatus roles family additionalDetails createdAt")
+    .select("firstName lastName email imageUrl accountStatus roles family additionalDetails memberId createdAt")
     .populate("family", "familyName familyCode")
     .populate("additionalDetails");
+
   if (!user || user.accountStatus !== "ACTIVE") {
     throw new ApiError(403, "MEMBERSHIP_CARD_UNAVAILABLE", "Membership card is available only for active members");
   }
+
+  const effectiveMemberId = user.memberId || `SMJ-${String(user._id).slice(-6).toUpperCase()}`;
+
+  // Ensure secure verification token exists (generates on first use)
+  const verificationToken = await ensureVerificationToken(user._id);
+
+  // Build production-safe QR verification URL
+  const frontendBase = (process.env.FRONTEND_URL || "http://halbahalbisamaj.vercel.app").replace(/\/$/, "");
+  const verifyUrl = `${frontendBase}/verify/member/${verificationToken}`;
+
+  // Fetch family members for the back side of the card
+  let familyMembers = [];
+  if (user.family) {
+    try {
+      const memberships = await FamilyMembership.find({
+        family: user.family._id || user.family,
+        status: "ACTIVE",
+      })
+        .populate("member", "firstName lastName")
+        .sort({ role: 1, createdAt: 1 })
+        .limit(15);
+
+      const seen = new Set();
+      familyMembers = memberships
+        .filter((m) => m.member)
+        .map((m) => {
+          const fullName = `${m.member.firstName || ""} ${m.member.lastName || ""}`.trim();
+          return {
+            name: fullName,
+            relationship: m.relationship || "FAMILY MEMBER",
+          };
+        })
+        .filter((m) => {
+          if (!m.name || seen.has(m.name)) return false;
+          seen.add(m.name);
+          return true;
+        });
+    } catch (e) {
+      // Non-critical — continue without family members
+    }
+  }
+
+  // Extract profile fields
+  const profile = user.additionalDetails || {};
+  const address = [profile.address, profile.currentCity, profile.nativePlace]
+    .filter(Boolean)
+    .join(", ") || null;
+
   return res.status(200).json(new ApiResponse("Membership card fetched successfully", {
     card: {
-      memberId: user._id,
+      memberId: effectiveMemberId,
+      rawId: user._id,
       name: `${user.firstName} ${user.lastName}`,
       photo: user.imageUrl,
+      email: user.email || null,
+      phone: profile.contactNumber || null,
+      address,
       status: user.accountStatus,
       family: user.family,
+      familyMembers,
       issuedAt: user.createdAt,
-      verifyUrl: `/api/v1/community/membership-cards/${user._id}/verify`,
+      // Secure QR URL (uses token, not memberId)
+      verifyUrl,
+      // Legacy field kept for backwards compatibility
+      verifyUrlLegacy: `/verify-member/${effectiveMemberId}`,
     },
   }));
 });
 
+/**
+ * Public endpoint: verify by secure token (QR code links here)
+ * Rate-limited by the public middleware
+ */
 exports.verifyMembershipCard = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.params.memberId).select("firstName lastName imageUrl accountStatus active");
-  if (!user) throw new ApiError(404, "MEMBER_NOT_FOUND", "Member was not found");
+  const identifier = req.params.memberId?.trim();
+  if (!identifier) {
+    throw new ApiError(400, "MEMBER_ID_REQUIRED", "Member identifier is required");
+  }
+
+  let user = null;
+
+  // First try: treat as a secure verification token (96-char hex)
+  if (/^[0-9a-f]{96}$/i.test(identifier)) {
+    user = await User.findOne({ verificationToken: identifier })
+      .select("+verificationToken")
+      .select("firstName lastName imageUrl accountStatus active memberId createdAt");
+  }
+
+  // Fallback: legacy memberId-based lookup (supports old printed cards)
+  if (!user) {
+    if (identifier.toUpperCase().startsWith("SMJ-")) {
+      user = await User.findOne({ memberId: identifier.toUpperCase() })
+        .select("firstName lastName imageUrl accountStatus active memberId createdAt");
+    } else if (mongoose.Types.ObjectId.isValid(identifier)) {
+      user = await User.findById(identifier)
+        .select("firstName lastName imageUrl accountStatus active memberId createdAt");
+    } else {
+      user = await User.findOne({ memberId: identifier.toUpperCase() })
+        .select("firstName lastName imageUrl accountStatus active memberId createdAt");
+    }
+  }
+
+  // Not found → return generic invalid response (do NOT 404 to prevent enumeration)
+  if (!user) {
+    return res.status(200).json(new ApiResponse("Verification complete", {
+      verified: false,
+      reason: "INVALID_CARD",
+      member: null,
+    }));
+  }
+
+  const isActive = user.active && user.accountStatus === "ACTIVE";
+
+  if (!isActive) {
+    return res.status(200).json(new ApiResponse("Verification complete", {
+      verified: false,
+      reason: "MEMBERSHIP_INACTIVE",
+      status: user.active ? user.accountStatus : "DEACTIVATED",
+      member: {
+        name: `${user.firstName} ${user.lastName}`,
+        memberId: user.memberId || `SMJ-${String(user._id).slice(-6).toUpperCase()}`,
+        status: user.active ? user.accountStatus : "DEACTIVATED",
+      },
+    }));
+  }
+
   return res.status(200).json(new ApiResponse("Membership card verification fetched", {
+    verified: true,
     member: {
-      memberId: user._id,
+      memberId: user.memberId || `SMJ-${String(user._id).slice(-6).toUpperCase()}`,
       name: `${user.firstName} ${user.lastName}`,
       photo: user.imageUrl,
-      valid: user.active && user.accountStatus === "ACTIVE",
-      status: user.active ? user.accountStatus : "DEACTIVATED",
+      valid: true,
+      status: user.accountStatus,
+      issuedAt: user.createdAt,
+      organization: "ADIVASI HALBA/HALBI SAMAJ KALYAN SAMITI, UJJAIN",
     },
   }));
 });
+
+/**
+ * Public endpoint: verify by secure token (new QR system)
+ * GET /community/membership-cards/verify-token/:token
+ */
+exports.verifyMemberByToken = asyncHandler(async (req, res) => {
+  const { token } = req.params;
+
+  // Validate token format (96-char hex)
+  if (!token || !/^[0-9a-f]{96}$/i.test(token)) {
+    return res.status(200).json(new ApiResponse("Verification complete", {
+      verified: false,
+      reason: "INVALID_CARD",
+    }));
+  }
+
+  const user = await User.findOne({ verificationToken: token })
+    .select("+verificationToken firstName lastName imageUrl accountStatus active memberId createdAt");
+
+  if (!user) {
+    return res.status(200).json(new ApiResponse("Verification complete", {
+      verified: false,
+      reason: "INVALID_CARD",
+    }));
+  }
+
+  const isActive = user.active && user.accountStatus === "ACTIVE";
+
+  if (!isActive) {
+    return res.status(200).json(new ApiResponse("Verification complete", {
+      verified: false,
+      reason: "MEMBERSHIP_INACTIVE",
+      status: user.active ? user.accountStatus : "DEACTIVATED",
+      member: {
+        name: `${user.firstName} ${user.lastName}`,
+        memberId: user.memberId || `SMJ-${String(user._id).slice(-6).toUpperCase()}`,
+        status: user.active ? user.accountStatus : "DEACTIVATED",
+      },
+    }));
+  }
+
+  return res.status(200).json(new ApiResponse("Membership verified", {
+    verified: true,
+    member: {
+      memberId: user.memberId || `SMJ-${String(user._id).slice(-6).toUpperCase()}`,
+      name: `${user.firstName} ${user.lastName}`,
+      photo: user.imageUrl,
+      valid: true,
+      status: user.accountStatus,
+      issuedAt: user.createdAt,
+      organization: "ADIVASI HALBA/HALBI SAMAJ KALYAN SAMITI, UJJAIN",
+    },
+  }));
+});
+

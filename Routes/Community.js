@@ -45,6 +45,7 @@ const {
   getShradhanjaliSupportingDocument,
   getMyMembershipCard,
   verifyMembershipCard,
+  verifyMemberByToken,
 } = require("../Controllers/Community");
 const { auth, optionalAuth, authorize } = require("../Middlewares/auth");
 const {
@@ -136,5 +137,7 @@ router.patch("/shradhanjalis/:shradhanjaliId/review", auth, authorize("shradhanj
 
 router.get("/membership-cards/me", auth, getMyMembershipCard);
 router.get("/membership-cards/:memberId/verify", verifyMembershipCard);
+// New secure token-based verification (no auth, safe public endpoint)
+router.get("/membership-cards/verify-token/:token", verifyMemberByToken);
 
 module.exports = router;
