@@ -60,45 +60,74 @@ exports.createAdminInvite = asyncHandler(async (req, res) => {
     throw new ApiError(400, "ADMIN_INVITE_FIELDS_REQUIRED", "Email and at least one role are required");
   }
 
+  // Validate that all roles are legitimate admin roles
   const invalidRoles = roles.filter((role) => !ADMIN_ROLES.includes(role));
   if (invalidRoles.length > 0) {
     throw new ApiError(400, "INVALID_ADMIN_ROLE", `Invalid admin role(s): ${invalidRoles.join(", ")}`);
   }
 
-  // Only SUPER_ADMIN can invite another SUPER_ADMIN
+  // Role escalation protection: Only SUPER_ADMIN can invite another SUPER_ADMIN
   if (roles.includes("SUPER_ADMIN") && !req.user.roles?.includes("SUPER_ADMIN")) {
     throw new ApiError(403, "FORBIDDEN", "Only Super Admins are authorized to grant Super Admin privileges");
   }
 
-  const existingUser = await User.findOne({ email });
-  if (existingUser?.accountStatus === "ACTIVE") {
-    throw new ApiError(409, "ADMIN_EMAIL_ALREADY_ACTIVE", "An active user already exists with this email");
+  // Self-invitation check
+  if (req.user.email && req.user.email.toLowerCase() === email) {
+    throw new ApiError(400, "SELF_INVITE_NOT_ALLOWED", "You cannot send an admin invitation to your own email address.");
   }
 
-  // Revoke any previous pending invites for this email to prevent duplicates
-  await AdminInvite.updateMany({ email, status: "PENDING" }, { status: "REVOKED" });
+  // Check if target user already exists and already has these admin roles
+  const existingUser = await User.findOne({ email });
+  if (existingUser && existingUser.accountType === "Admin" && existingUser.accountStatus === "ACTIVE") {
+    const alreadyHasRoles = roles.every((r) => existingUser.roles?.includes(r));
+    if (alreadyHasRoles) {
+      throw new ApiError(409, "USER_ALREADY_ADMIN", "This user is already an active administrator with these assigned roles.");
+    }
+  }
+
+  // Duplicate active invitation protection
+  const existingPending = await AdminInvite.findOne({
+    email,
+    status: "PENDING",
+    expiresAt: { $gt: new Date() },
+  });
+
+  if (existingPending) {
+    throw new ApiError(409, "ACTIVE_INVITATION_EXISTS", "An active invitation already exists for this email. You can resend or revoke it from the invitation list.", {
+      existingInviteId: existingPending._id,
+      roles: existingPending.roles,
+      expiresAt: existingPending.expiresAt,
+    });
+  }
+
+  // Clean up any stale/expired pending invites for this email
+  await AdminInvite.updateMany(
+    { email, status: "PENDING" },
+    { status: "EXPIRED" }
+  );
 
   const rawToken = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
   const invite = await AdminInvite.create({
     email,
     roles,
     tokenHash: hashToken(rawToken),
     invitedBy: req.user.id,
-    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    expiresAt,
   });
 
   const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-  const url = `${frontendUrl}/admin-invite/${rawToken}`;
+  const url = `${frontendUrl}/admin/invite/accept/${rawToken}`;
 
   try {
     await mailSender(
       email,
-      "Samaj Community Platform — Administrator Invitation",
+      "You're invited to join Samaj Administration | Adivasi Halba/Halbi Samaj Kalyan Samiti",
       adminInviteEmail({ email, roles, url })
     );
   } catch (mailError) {
     console.error(`[Admin.js] Invitation created (ID: ${invite._id}) but email sending failed:`, mailError.message);
-    // Keep invite valid so admin can share URL manually or retry, but inform in response
   }
 
   await logAudit({
@@ -106,7 +135,7 @@ exports.createAdminInvite = asyncHandler(async (req, res) => {
     action: "admin.invite.created",
     targetType: "adminInvite",
     target: invite._id,
-    newValue: { email, roles },
+    newValue: { email, roles, expiresAt },
     req,
   });
 
@@ -117,37 +146,158 @@ exports.createAdminInvite = asyncHandler(async (req, res) => {
       roles: invite.roles,
       status: invite.status,
       expiresAt: invite.expiresAt,
+      isExistingUser: !!existingUser,
     },
+  }));
+});
+
+exports.validateAdminInvite = asyncHandler(async (req, res) => {
+  const { token } = req.params;
+  if (!token) {
+    throw new ApiError(400, "TOKEN_REQUIRED", "Invitation token is required");
+  }
+
+  const tokenHash = hashToken(token);
+  const invite = await AdminInvite.findOne({ tokenHash });
+
+  if (!invite) {
+    return res.status(200).json(new ApiResponse("Invitation validated", {
+      state: "INVALID",
+      message: "This invitation link is not valid.",
+    }));
+  }
+
+  if (invite.status === "REVOKED") {
+    return res.status(200).json(new ApiResponse("Invitation validated", {
+      state: "REVOKED",
+      message: "This invitation is no longer active.",
+    }));
+  }
+
+  if (invite.status === "ACCEPTED") {
+    return res.status(200).json(new ApiResponse("Invitation validated", {
+      state: "ALREADY_USED",
+      message: "This invitation has already been accepted. If you already have an account, please sign in.",
+    }));
+  }
+
+  if (invite.status === "EXPIRED" || invite.expiresAt <= new Date()) {
+    if (invite.status === "PENDING") {
+      invite.status = "EXPIRED";
+      await invite.save();
+    }
+    return res.status(200).json(new ApiResponse("Invitation validated", {
+      state: "EXPIRED",
+      message: "This invitation has expired. Please ask an authorized administrator to send a new invitation.",
+    }));
+  }
+
+  // Token is valid and pending
+  const existingUser = await User.findOne({ email: invite.email });
+
+  return res.status(200).json(new ApiResponse("Invitation validated", {
+    state: "VALID",
+    email: invite.email,
+    roles: invite.roles,
+    expiresAt: invite.expiresAt,
+    isExistingUser: !!existingUser,
+    existingUserName: existingUser ? `${existingUser.firstName} ${existingUser.lastName}` : null,
   }));
 });
 
 exports.acceptAdminInvite = asyncHandler(async (req, res) => {
   const { token, firstName, lastName, password, confirmPassword } = req.body;
 
-  if (!token || !firstName || !lastName || !password || !confirmPassword) {
-    throw new ApiError(400, "ADMIN_INVITE_ACCEPT_FIELDS_REQUIRED", "Token, name, and password are required");
+  if (!token) {
+    throw new ApiError(400, "TOKEN_REQUIRED", "Invitation token is required");
+  }
+
+  const tokenHash = hashToken(token);
+  const invite = await AdminInvite.findOne({
+    tokenHash,
+    status: "PENDING",
+    expiresAt: { $gt: new Date() },
+  });
+
+  if (!invite) {
+    const anyInvite = await AdminInvite.findOne({ tokenHash });
+    if (!anyInvite) {
+      throw new ApiError(400, "ADMIN_INVITE_INVALID", "This invitation link is not valid.");
+    }
+    if (anyInvite.status === "ACCEPTED") {
+      throw new ApiError(400, "ADMIN_INVITE_ALREADY_USED", "This invitation has already been accepted.");
+    }
+    if (anyInvite.status === "REVOKED") {
+      throw new ApiError(400, "ADMIN_INVITE_REVOKED", "This invitation is no longer active.");
+    }
+    throw new ApiError(400, "ADMIN_INVITE_EXPIRED", "This invitation has expired.");
+  }
+
+  const existingUser = await User.findOne({ email: invite.email });
+
+  if (existingUser) {
+    // Existing user flow: verify credentials if password provided
+    if (password) {
+      const isPasswordMatch = await bcrypt.compare(password, existingUser.password);
+      if (!isPasswordMatch) {
+        throw new ApiError(401, "INVALID_CREDENTIALS", "Incorrect password for your existing account.");
+      }
+    }
+
+    // Activate/merge admin roles on existing user without duplicating account or member records
+    const updatedRoles = Array.from(new Set([...(existingUser.roles || []), ...invite.roles]));
+    existingUser.roles = updatedRoles;
+    existingUser.accountType = "Admin";
+    existingUser.accountStatus = "ACTIVE";
+    existingUser.approved = true;
+    if (!existingUser.reviewHistory) existingUser.reviewHistory = [];
+    existingUser.reviewHistory.push({
+      action: "APPROVED",
+      reason: "Admin invitation accepted (existing user linked)",
+      reviewedBy: invite.invitedBy,
+    });
+    await existingUser.save();
+
+    invite.status = "ACCEPTED";
+    invite.acceptedBy = existingUser._id;
+    invite.acceptedAt = new Date();
+    await invite.save();
+
+    await logAudit({
+      actor: existingUser._id,
+      action: "admin.invite.accepted",
+      targetType: "user",
+      target: existingUser._id,
+      newValue: { email: invite.email, roles: invite.roles, linkedExisting: true },
+      req,
+    });
+
+    await logAudit({
+      actor: existingUser._id,
+      action: "admin.role.assigned",
+      targetType: "user",
+      target: existingUser._id,
+      newValue: { roles: updatedRoles },
+      req,
+    });
+
+    return res.status(200).json(new ApiResponse("Admin privileges activated on existing account successfully", {
+      user: sanitizeUser(existingUser),
+      isExistingUser: true,
+    }));
+  }
+
+  // New user flow: validate inputs and create new admin account
+  if (!firstName || !lastName || !password || !confirmPassword) {
+    throw new ApiError(400, "ADMIN_INVITE_ACCEPT_FIELDS_REQUIRED", "First name, last name, and matching passwords are required");
   }
 
   if (password !== confirmPassword) {
     throw new ApiError(400, "PASSWORD_MISMATCH", "Password and confirm password do not match");
   }
 
-  const invite = await AdminInvite.findOne({
-    tokenHash: hashToken(token),
-    status: "PENDING",
-  });
-
-  if (!invite || invite.expiresAt <= new Date()) {
-    if (invite && invite.status === "PENDING") {
-      invite.status = "EXPIRED";
-      await invite.save();
-    }
-    throw new ApiError(400, "ADMIN_INVITE_INVALID", "Invite is invalid or expired");
-  }
-
-  const existingUser = await User.findOne({ email: invite.email });
-  if (existingUser?.accountStatus === "ACTIVE") {
-    throw new ApiError(409, "ADMIN_EMAIL_ALREADY_ACTIVE", "An active user already exists with this email");
+  if (password.length < 8) {
+    throw new ApiError(400, "PASSWORD_TOO_SHORT", "Password must be at least 8 characters long");
   }
 
   const profile = await Profile.create({});
@@ -160,11 +310,11 @@ exports.acceptAdminInvite = asyncHandler(async (req, res) => {
     roles: invite.roles,
     accountStatus: "ACTIVE",
     approved: true,
-    imageUrl: `https://api.dicebear.com/5.x/initials/svg?seed=${firstName}-${lastName}`,
+    imageUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(`${firstName} ${lastName}`)}`,
     additionalDetails: profile._id,
     reviewHistory: [{
       action: "APPROVED",
-      reason: "Admin invite accepted",
+      reason: "Admin invite accepted (new admin account)",
       reviewedBy: invite.invitedBy,
     }],
   });
@@ -175,39 +325,111 @@ exports.acceptAdminInvite = asyncHandler(async (req, res) => {
   await invite.save();
 
   await logAudit({
-    actor: invite.invitedBy,
+    actor: adminUser._id,
     action: "admin.invite.accepted",
     targetType: "user",
     target: adminUser._id,
-    newValue: { email: invite.email, roles: invite.roles },
+    newValue: { email: invite.email, roles: invite.roles, linkedExisting: false },
     req,
   });
 
   return res.status(201).json(new ApiResponse("Admin account activated successfully", {
     user: sanitizeUser(adminUser),
+    isExistingUser: false,
   }));
 });
 
-exports.listAdminInvites = asyncHandler(async (req, res) => {
-  const invites = await AdminInvite.find()
-    .populate("invitedBy", "firstName lastName email")
-    .populate("acceptedBy", "firstName lastName email")
-    .sort({ createdAt: -1 })
-    .limit(100);
+exports.resendAdminInvite = asyncHandler(async (req, res) => {
+  const { inviteId } = req.params;
+  const invite = await AdminInvite.findById(inviteId);
 
-  return res.status(200).json(new ApiResponse("Admin invites fetched successfully", { invites }));
+  if (!invite) {
+    throw new ApiError(404, "INVITE_NOT_FOUND", "Invitation was not found");
+  }
+
+  if (invite.status === "ACCEPTED") {
+    throw new ApiError(400, "INVITE_ALREADY_ACCEPTED", "Cannot resend an invitation that has already been accepted.");
+  }
+
+  // Token rotation: generate new raw token & hash, invalidate old token
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  invite.tokenHash = hashToken(rawToken);
+  invite.status = "PENDING";
+  invite.expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  invite.resentAt = new Date();
+  invite.resendCount = (invite.resendCount || 0) + 1;
+  await invite.save();
+
+  const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+  const url = `${frontendUrl}/admin/invite/accept/${rawToken}`;
+
+  try {
+    await mailSender(
+      invite.email,
+      "Reminder: You're invited to join Samaj Administration | Adivasi Halba/Halbi Samaj Kalyan Samiti",
+      adminInviteEmail({ email: invite.email, roles: invite.roles, url })
+    );
+  } catch (mailError) {
+    console.error(`[Admin.js] Invitation resent (ID: ${invite._id}) but email sending failed:`, mailError.message);
+  }
+
+  await logAudit({
+    actor: req.user.id,
+    action: "admin.invite.resent",
+    targetType: "adminInvite",
+    target: invite._id,
+    newValue: { email: invite.email, roles: invite.roles, resendCount: invite.resendCount },
+    req,
+  });
+
+  return res.status(200).json(new ApiResponse("Invitation resent successfully", { invite }));
+});
+
+exports.listAdminInvites = asyncHandler(async (req, res) => {
+  // Auto-expire past pending invites
+  await AdminInvite.updateMany(
+    { status: "PENDING", expiresAt: { $lte: new Date() } },
+    { status: "EXPIRED" }
+  );
+
+  const [invites, activeAdmins] = await Promise.all([
+    AdminInvite.find()
+      .populate("invitedBy", "firstName lastName email")
+      .populate("acceptedBy", "firstName lastName email")
+      .populate("revokedBy", "firstName lastName email")
+      .sort({ createdAt: -1 })
+      .limit(200),
+    User.find({ accountType: "Admin", accountStatus: "ACTIVE" })
+      .select("firstName lastName email roles createdAt imageUrl approved")
+      .sort({ createdAt: -1 }),
+  ]);
+
+  return res.status(200).json(new ApiResponse("Admin invites fetched successfully", {
+    invites,
+    activeAdmins,
+  }));
 });
 
 exports.revokeAdminInvite = asyncHandler(async (req, res) => {
-  const invite = await AdminInvite.findOneAndUpdate(
-    { _id: req.params.inviteId, status: "PENDING" },
-    { status: "REVOKED" },
-    { new: true }
-  );
+  const invite = await AdminInvite.findById(req.params.inviteId);
 
   if (!invite) {
-    throw new ApiError(404, "ADMIN_INVITE_NOT_REVOKABLE", "Invite was not found or is no longer pending");
+    throw new ApiError(404, "ADMIN_INVITE_NOT_FOUND", "Invite was not found");
   }
+
+  if (invite.status === "ACCEPTED") {
+    throw new ApiError(400, "CANNOT_REVOKE_ACCEPTED_INVITE", "Accepted invitations cannot be revoked. To remove admin privileges, use Admin Role Management on the active administrator.");
+  }
+
+  if (invite.status !== "PENDING") {
+    throw new ApiError(400, "ADMIN_INVITE_NOT_REVOKABLE", `Invite is already ${invite.status.toLowerCase()}`);
+  }
+
+  invite.status = "REVOKED";
+  invite.revokedAt = new Date();
+  invite.revokedBy = req.user.id;
+  invite.revocationReason = req.body.reason || "Revoked by admin";
+  await invite.save();
 
   await logAudit({
     actor: req.user.id,
@@ -215,7 +437,7 @@ exports.revokeAdminInvite = asyncHandler(async (req, res) => {
     targetType: "adminInvite",
     target: invite._id,
     oldValue: { status: "PENDING" },
-    newValue: { status: "REVOKED" },
+    newValue: { status: "REVOKED", reason: invite.revocationReason },
     req,
   });
 

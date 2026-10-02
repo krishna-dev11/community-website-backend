@@ -241,8 +241,8 @@ exports.searchMemberDirectory = asyncHandler(async (req, res) => {
       .populate("additionalDetails")
       .populate("family", "familyName familyCode currentCity nativePlace");
   } else {
-    // Normal members: select only _id, firstName, lastName
-    queryBuilder = queryBuilder.select("_id firstName lastName");
+    // Normal members: strictly select only _id, firstName, lastName, imageUrl
+    queryBuilder = queryBuilder.select("_id firstName lastName imageUrl");
   }
 
   const [users, total] = await Promise.all([
@@ -256,6 +256,9 @@ exports.searchMemberDirectory = asyncHandler(async (req, res) => {
         _id: directoryUser._id,
         firstName: directoryUser.firstName,
         lastName: directoryUser.lastName,
+        name: `${directoryUser.firstName || ""} ${directoryUser.lastName || ""}`.trim(),
+        profilePhoto: directoryUser.imageUrl || null,
+        imageUrl: directoryUser.imageUrl || null,
       };
     }
     return projectDirectoryUser(directoryUser, req.user);

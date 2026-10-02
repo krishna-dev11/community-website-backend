@@ -38,6 +38,17 @@ const adminInviteSchema = new mongoose.Schema({
     required: true,
     index: true,
   },
+  resendCount: {
+    type: Number,
+    default: 0,
+  },
+  resentAt: Date,
+  revokedAt: Date,
+  revokedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "user",
+  },
+  revocationReason: String,
 }, { timestamps: true });
 
 adminInviteSchema.index(
